@@ -13,7 +13,7 @@ export const runtime = "nodejs";
 const bodySchema = z.object({
   repoUrl: z.string().url(),
   prompt: z.string().min(1),
-  provider: z.enum(["mock", "openai", "anthropic"]).default("mock"),
+  provider: z.enum(["mock", "openai", "anthropic", "google", "groq"]).default("mock"),
   model: z.string().optional()
 });
 

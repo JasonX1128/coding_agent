@@ -6,7 +6,7 @@ import { z } from "zod";
 export const runtime = "nodejs";
 
 const bodySchema = z.object({
-  provider: z.enum(["mock", "openai", "anthropic"]).default("mock"),
+  provider: z.enum(["mock", "openai", "anthropic", "google", "groq"]).default("mock"),
   model: z.string().optional(),
   prompt: z.string().min(1),
   daemonOrigin: z.string().url().default(DEFAULT_DAEMON_ORIGIN),
@@ -56,4 +56,3 @@ function createDaemonExecutor(daemonOrigin: string, workspaceId: string): ToolEx
     return data;
   };
 }
-

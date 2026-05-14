@@ -220,6 +220,8 @@ export default function Home() {
                 <option value="mock">mock</option>
                 <option value="openai">openai</option>
                 <option value="anthropic">anthropic</option>
+                <option value="google">google</option>
+                <option value="groq">groq</option>
               </select>
               <input placeholder="model override" value={model} onChange={(event) => setModel(event.target.value)} />
             </div>
@@ -408,4 +410,3 @@ function ToolEvents({ events }: { events: AgentToolEvent[] }) {
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }
-

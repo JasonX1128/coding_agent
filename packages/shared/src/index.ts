@@ -1,7 +1,7 @@
 export const DEFAULT_DAEMON_ORIGIN = "http://127.0.0.1:4317";
 
 export type AgentMode = "local" | "github";
-export type AgentProvider = "mock" | "openai" | "anthropic";
+export type AgentProvider = "mock" | "openai" | "anthropic" | "google" | "groq";
 
 export type Workspace = {
   id: string;
@@ -85,4 +85,3 @@ export type DaemonToolName =
   | "git_diff"
   | "apply_patch"
   | "run_command";
-
