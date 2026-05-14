@@ -1,0 +1,27 @@
+{
+  "name": "coding-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local and GitHub-directed LLM development agent MVP.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build:packages": "npm run build --workspace @coding-agent/shared && npm run build --workspace @coding-agent/agent-core",
+    "dev": "npm run build:packages && concurrently -n daemon,web -c cyan,magenta \"npm:dev:daemon\" \"npm:dev:web\"",
+    "dev:web": "npm run dev --workspace @coding-agent/web",
+    "dev:daemon": "WORKSPACE_ROOT=$PWD npm run dev --workspace @coding-agent/local-daemon",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run build:packages && npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "latest",
+    "@types/node": "latest",
+    "typescript": "latest"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
