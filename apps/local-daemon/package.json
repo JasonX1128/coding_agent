@@ -1,0 +1,22 @@
+{
+  "name": "@coding-agent/local-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@coding-agent/shared": "*",
+    "@fastify/cors": "latest",
+    "diff": "latest",
+    "fastify": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest"
+  }
+}
