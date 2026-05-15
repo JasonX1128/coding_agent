@@ -28,8 +28,9 @@ type GitHubRepository = {
   htmlUrl: string;
 };
 
-type GitHubPrResult = AgentRunResponse & {
+type GitHubTaskResult = AgentRunResponse & {
   repository?: string;
+  mode?: "read" | "write";
   branchName?: string;
   pullRequestUrl?: string;
   pullRequestNumber?: number;
@@ -56,8 +57,8 @@ export default function Home() {
   const [githubInstallUrl, setGithubInstallUrl] = useState("/api/github/install");
   const [githubRepos, setGithubRepos] = useState<GitHubRepository[]>([]);
   const [githubRepoFullName, setGithubRepoFullName] = useState("");
-  const [githubPrompt, setGithubPrompt] = useState("Make a small README update that explains this repo was touched by the coding agent.");
-  const [githubResult, setGithubResult] = useState<GitHubPrResult | null>(null);
+  const [githubPrompt, setGithubPrompt] = useState("Inspect this repository and summarize what it does.");
+  const [githubResult, setGithubResult] = useState<GitHubTaskResult | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -175,7 +176,8 @@ export default function Home() {
           repoFullName: selectedGithubRepo.fullName,
           prompt: githubPrompt,
           provider,
-          model: model || undefined
+          model: model || undefined,
+          mode: "auto"
         })
       });
       const data = await response.json();
@@ -220,7 +222,7 @@ export default function Home() {
       <header className="topbar">
         <div className="brand">
           <h1>Coding Agent MVP</h1>
-          <span>Local daemon tools plus GitHub repo analysis with pluggable model providers.</span>
+          <span>Local daemon tools plus prompt-driven GitHub repository tasks.</span>
         </div>
         <div className={`status-pill ${daemonStatus === "online" ? "ok" : ""}`}>
           daemon: {daemonStatus}
@@ -430,11 +432,11 @@ function GithubAgentPanel({
   loadGithubRepositories: () => void;
   runGithubAgent: () => void;
   busy: string | null;
-  githubResult: GitHubPrResult | null;
+  githubResult: GitHubTaskResult | null;
 }) {
   return (
     <section className="panel stack">
-      <h2>GitHub PR Agent</h2>
+      <h2>GitHub Agent</h2>
       <div className="row">
         <a className="button-link" href={githubInstallUrl}>
           Install App
@@ -456,7 +458,7 @@ function GithubAgentPanel({
       </label>
       <textarea rows={5} value={githubPrompt} onChange={(event) => setGithubPrompt(event.target.value)} />
       <button className="primary" disabled={busy === "github-agent" || !githubRepoFullName || !githubPrompt.trim()} onClick={runGithubAgent}>
-        Open Pull Request
+        Run Agent
       </button>
       <div className="statusline">
         {githubResult?.pullRequestUrl ? (
@@ -464,9 +466,9 @@ function GithubAgentPanel({
             Pull request #{githubResult.pullRequestNumber}: {githubResult.pullRequestUrl}
           </a>
         ) : githubResult?.repository ? (
-          `Repository: ${githubResult.repository}`
+          `Repository: ${githubResult.repository} · ${githubResult.mode === "write" ? "write run" : "read-only run"}`
         ) : (
-          "Install the GitHub App, load repositories, then select one to create an agent PR."
+          "Install the GitHub App, load repositories, then select one and prompt the agent."
         )}
       </div>
       <pre className="chat-output">{githubResult?.text || "No GitHub agent result yet."}</pre>

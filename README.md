@@ -5,7 +5,7 @@ This repository implements the first working slice of the plan in `DEVELOPMENT_A
 - a browser UI for local coding-agent workflows,
 - a local daemon that safely brokers file/search/git/patch/command access,
 - a provider-neutral agent core with OpenAI, Anthropic, Google Gemini, Groq, and mock modes,
-- a local GitHub repo-analysis route that can clone a GitHub repository into a disposable local sandbox.
+- a GitHub App repository-task route that can inspect repositories or open PRs from prompt-driven work.
 
 ## Quick Start
 
@@ -58,10 +58,10 @@ those with `GOOGLE_MODEL`, `GOOGLE_BACKUP_MODEL`, and `GOOGLE_LAST_RESORT_MODEL`
 
 The GitHub tab supports two flows:
 
-1. GitHub App PR flow for installed repositories.
+1. GitHub App repository flow for installed repositories.
 2. Legacy public-URL analysis through `/api/github-agent`.
 
-### GitHub App PR Flow
+### GitHub App Repository Flow
 
 Create and install a GitHub App, then set:
 
@@ -96,13 +96,19 @@ Then:
 3. Click **Install App** if the app is not installed yet.
 4. Click **Load Repositories**.
 5. Select an installed repository.
-6. Enter a prompt that asks for a concrete file change.
-7. Click **Open Pull Request**.
+6. Enter a prompt.
+7. Click **Run Agent**.
 
-The app clones the repository into `.agent-sandboxes/`, creates an `agent/*`
-branch, runs the agent with file/search/patch/git/command tools, commits any
-changes, pushes the branch with a short-lived installation token, and opens a
-pull request against the repository default branch.
+The prompt determines the outcome. Analysis, explanation, planning, review, and
+inspection prompts run read-only and return a text response. Prompts that ask the
+agent to add, edit, fix, implement, or open a PR run in write mode.
+
+In write mode, the app clones the repository into `.agent-sandboxes/`, creates an
+`agent/*` branch, runs the agent with file/search/patch/git/command tools,
+commits non-empty changes, pushes the branch with a short-lived installation
+token, and opens a pull request against the repository default branch. If no
+non-empty file changes are produced, it returns the agent response without
+opening a pull request.
 
 The agent does not approve or merge pull requests. Protect `main` or your default
 branch with GitHub rulesets if you want GitHub itself to enforce PR-only changes.

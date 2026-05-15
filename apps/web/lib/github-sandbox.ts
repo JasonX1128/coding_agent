@@ -22,16 +22,21 @@ import {
   openPullRequest
 } from "./github-app";
 
-export type GitHubPrTaskRequest = {
+export type GitHubTaskMode = "auto" | "read" | "write";
+type ResolvedGitHubTaskMode = Exclude<GitHubTaskMode, "auto">;
+
+export type GitHubRepositoryTaskRequest = {
   installationId: number;
   repoFullName: string;
   prompt: string;
   provider: AgentProvider;
   model?: string;
+  mode?: GitHubTaskMode;
 };
 
-export type GitHubPrTaskResult = AgentRunResponse & {
+export type GitHubRepositoryTaskResult = AgentRunResponse & {
   repository: string;
+  mode: ResolvedGitHubTaskMode;
   branchName?: string;
   pullRequestUrl?: string;
   pullRequestNumber?: number;
@@ -42,46 +47,62 @@ export type GitHubPrTaskResult = AgentRunResponse & {
 const skippedDirectories = new Set([".git", "node_modules", ".next", "dist", "coverage", ".turbo"]);
 const maxOutputBytes = 200_000;
 
-export async function runGitHubPrTask(request: GitHubPrTaskRequest): Promise<GitHubPrTaskResult> {
+export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskRequest): Promise<GitHubRepositoryTaskResult> {
   const repo = await findInstalledRepository(request.repoFullName, request.installationId);
   const installationToken = await createInstallationToken(repo.installationId);
   const sandboxRoot = await createSandboxRoot();
   const cloneUrl = tokenizedCloneUrl(repo.fullName, installationToken.token);
-  const branchName = createAgentBranchName(request.prompt);
+  const mode = resolveTaskMode(request.prompt, request.mode || "auto");
+  const branchName = mode === "write" ? createAgentBranchName(request.prompt) : undefined;
 
   await runRequired("git", ["clone", "--depth", "1", cloneUrl, sandboxRoot], process.cwd(), 120_000, installationToken.token);
   await runRequired("git", ["remote", "set-url", "origin", `https://github.com/${repo.fullName}.git`], sandboxRoot, 20_000);
-  await runRequired("git", ["checkout", "-b", branchName], sandboxRoot, 20_000);
-  await runRequired("git", ["config", "user.name", `${process.env.GITHUB_APP_SLUG || "coding-agent"}[bot]`], sandboxRoot, 20_000);
-  await runRequired(
-    "git",
-    ["config", "user.email", `${process.env.GITHUB_APP_ID || "0"}+${process.env.GITHUB_APP_SLUG || "coding-agent"}[bot]@users.noreply.github.com`],
-    sandboxRoot,
-    20_000
-  );
+  if (mode === "write" && branchName) {
+    await runRequired("git", ["checkout", "-b", branchName], sandboxRoot, 20_000);
+    await runRequired("git", ["config", "user.name", `${process.env.GITHUB_APP_SLUG || "coding-agent"}[bot]`], sandboxRoot, 20_000);
+    await runRequired(
+      "git",
+      ["config", "user.email", `${process.env.GITHUB_APP_ID || "0"}+${process.env.GITHUB_APP_SLUG || "coding-agent"}[bot]@users.noreply.github.com`],
+      sandboxRoot,
+      20_000
+    );
+  }
 
   const rootPath = await realpath(sandboxRoot);
-  const executor = createWritableSandboxExecutor(rootPath);
+  const executor = mode === "write" ? createWritableSandboxExecutor(rootPath) : createReadOnlySandboxExecutor(rootPath);
   const result = await runAgentTask({
     provider: request.provider,
     model: request.model,
-    prompt: buildPrPrompt(repo.fullName, repo.defaultBranch, branchName, request.prompt),
+    prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt),
     executor,
     maxToolRounds: 12
   });
 
   const changedFiles = await changedFileNames(rootPath);
   const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
+  if (mode === "read") {
+    return {
+      ...result,
+      repository: repo.fullName,
+      mode,
+      changedFiles: [],
+      sandboxRoot
+    };
+  }
+
   if (committableFiles.length === 0) {
     return {
       ...result,
       repository: repo.fullName,
+      mode,
       branchName,
       changedFiles: committableFiles,
       sandboxRoot,
       text: `${result.text}\n\nNo non-empty file changes were produced, so no pull request was opened.`
     };
   }
+
+  if (!branchName) throw new Error("Write-mode GitHub task did not create a working branch.");
 
   await runRequired("git", ["add", "-A", "--", ...committableFiles], rootPath, 20_000);
   await runRequired("git", ["commit", "-m", commitTitle(request.prompt)], rootPath, 60_000);
@@ -105,11 +126,27 @@ export async function runGitHubPrTask(request: GitHubPrTaskRequest): Promise<Git
   return {
     ...result,
     repository: repo.fullName,
+    mode,
     branchName,
     pullRequestUrl: pullRequest.htmlUrl,
     pullRequestNumber: pullRequest.number,
     changedFiles: committableFiles,
     sandboxRoot
+  };
+}
+
+function createReadOnlySandboxExecutor(rootPath: string): ToolExecutor {
+  return async (name: DaemonToolName, args: Record<string, unknown>) => {
+    try {
+      if (name === "list_files") return listFilesTool(rootPath, args);
+      if (name === "read_file") return readFileTool(rootPath, args);
+      if (name === "search_text") return searchTool(rootPath, args);
+      if (name === "git_status") return gitTool(rootPath, "status");
+      if (name === "git_diff") return gitTool(rootPath, "diff");
+      return toolResult("requires_approval", `${name} is disabled because this prompt is running in read-only repository mode.`, undefined, "medium");
+    } catch (error) {
+      return toolResult("failed", error instanceof Error ? error.message : "Unknown sandbox tool error");
+    }
   };
 }
 
@@ -376,18 +413,38 @@ function tokenizedCloneUrl(fullName: string, token: string): string {
   return `https://x-access-token:${encodeURIComponent(token)}@github.com/${fullName}.git`;
 }
 
-function buildPrPrompt(repoFullName: string, defaultBranch: string, branchName: string, userPrompt: string): string {
-  return [
-    `Repository: ${repoFullName}`,
-    `Base branch: ${defaultBranch}`,
+function buildRepositoryPrompt(
+  repoFullName: string,
+  defaultBranch: string,
+  branchName: string | undefined,
+  mode: ResolvedGitHubTaskMode,
+  userPrompt: string
+): string {
+  const writeInstructions = [
     `Working branch: ${branchName}`,
     "",
-    "You are running in a disposable GitHub App sandbox.",
-    "Make only the changes needed for the user's request.",
+    "The user's prompt appears to request code or file changes, so write tools are enabled.",
     "Use create_file for new text files and apply_patch for edits to existing files.",
     "Do not use run_command to create or edit files.",
     "Do not use touch, echo, cat, tee, heredocs, or shell redirection for file edits.",
     "Before finishing, ensure any new file requested by the user has non-empty content.",
+    "A pull request will be opened only if non-empty file changes are produced."
+  ];
+
+  const readInstructions = [
+    "The user's prompt appears to ask for analysis, explanation, planning, review, or another text-only response.",
+    "Read-only tools are enabled.",
+    "Do not attempt to create, edit, commit, push, approve, merge, or open a pull request.",
+    "Answer with useful text based on repository inspection."
+  ];
+
+  return [
+    `Repository: ${repoFullName}`,
+    `Base branch: ${defaultBranch}`,
+    "",
+    "You are running in a disposable GitHub App sandbox.",
+    "Do only the work needed for the user's request.",
+    ...(mode === "write" ? writeInstructions : readInstructions),
     "Do not approve, merge, or push directly to the base branch.",
     "Run relevant tests if they are obvious and reasonably cheap.",
     "",
@@ -415,6 +472,37 @@ function prTitle(prompt: string): string {
 function humanTitle(prompt: string): string {
   const line = prompt.replace(/\s+/g, " ").trim().slice(0, 72);
   return line || "apply requested changes";
+}
+
+function resolveTaskMode(prompt: string, requestedMode: GitHubTaskMode): ResolvedGitHubTaskMode {
+  if (requestedMode === "read" || requestedMode === "write") return requestedMode;
+  return promptLooksWriteIntent(prompt) ? "write" : "read";
+}
+
+function promptLooksWriteIntent(prompt: string): boolean {
+  const text = prompt.toLowerCase();
+  const explicitReadOnlyPatterns = [
+    /\b(do not edit|don't edit|no changes|read[- ]only|without changing|just tell me)\b/,
+    /^\s*(explain|summari[sz]e|describe|analy[sz]e|inspect|review|audit|find|look for|what|why|how|where|which|when|plan|recommend|compare)\b/
+  ];
+  const textOnlyCreationPattern =
+    /^\s*(please\s+|can you\s+|could you\s+|would you\s+|i want you to\s+)?(create|write|make)\s+(a\s+|an\s+)?(plan|summary|analysis|explanation|recommendation)\b/;
+  const fileArtifactPattern = /\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md)\b/;
+  const pullRequestPattern = /\b(open|make|submit|raise)\b[\s\S]{0,40}\b(pr|pull request)\b/;
+  const writePatterns = [
+    /^\s*(please\s+|can you\s+|could you\s+|would you\s+|i want you to\s+|let'?s\s+)?(add|create|write|edit|change|update|modify|fix|implement|refactor|remove|delete|rename|move|replace)\b/,
+    /\b(fix|implement|add|create|write|edit|change|update|modify|refactor|remove|delete|rename|move|replace)\b[\s\S]{0,80}\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md)\b/,
+    /\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md)\b[\s\S]{0,80}\b(add|create|write|edit|change|update|modify|fix|implement|refactor|remove|delete|rename|move|replace)\b/,
+    /\bmake\b[\s\S]{0,40}\b(file|change|edit|update|commit)\b/,
+    /\bfix\s+(it|this|that)\b/
+  ];
+
+  if (pullRequestPattern.test(text)) return true;
+  if (textOnlyCreationPattern.test(text) && !fileArtifactPattern.test(text)) return false;
+  if (explicitReadOnlyPatterns.some((pattern) => pattern.test(text)) && !writePatterns.some((pattern) => pattern.test(text))) {
+    return false;
+  }
+  return writePatterns.some((pattern) => pattern.test(text));
 }
 
 function prBody(prompt: string, result: AgentRunResponse, changedFiles: string[]): string {
