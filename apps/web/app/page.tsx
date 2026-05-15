@@ -38,6 +38,21 @@ type GitHubTaskResult = AgentRunResponse & {
   sandboxRoot?: string;
 };
 
+type GitHubPullRequest = {
+  id: number;
+  number: number;
+  title: string;
+  state: string;
+  draft: boolean;
+  htmlUrl: string;
+  authorLogin: string;
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export default function Home() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("local");
   const [daemonOrigin, setDaemonOrigin] = useState(DEFAULT_DAEMON_ORIGIN);
@@ -59,6 +74,8 @@ export default function Home() {
   const [githubRepoFullName, setGithubRepoFullName] = useState("");
   const [githubPrompt, setGithubPrompt] = useState("Inspect this repository and summarize what it does.");
   const [githubResult, setGithubResult] = useState<GitHubTaskResult | null>(null);
+  const [githubPullRequests, setGithubPullRequests] = useState<GitHubPullRequest[]>([]);
+  const [githubPullMessage, setGithubPullMessage] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -190,6 +207,74 @@ export default function Home() {
     }
   }
 
+  function selectGithubRepo(fullName: string) {
+    setGithubRepoFullName(fullName);
+    setGithubPullRequests([]);
+    setGithubPullMessage("");
+  }
+
+  async function fetchGithubPullRequestsForSelected(): Promise<GitHubPullRequest[]> {
+    if (!selectedGithubRepo) throw new Error("Select an installed GitHub repository first.");
+    const params = new URLSearchParams({
+      installationId: String(selectedGithubRepo.installationId),
+      repoFullName: selectedGithubRepo.fullName
+    });
+    const response = await fetch(`/api/github/pulls?${params.toString()}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data?.error || "Could not load GitHub pull requests.");
+    return Array.isArray(data.pullRequests) ? data.pullRequests : [];
+  }
+
+  async function loadGithubPullRequests() {
+    setBusy("github-pulls");
+    setError(null);
+    try {
+      const pullRequests = await fetchGithubPullRequestsForSelected();
+      setGithubPullRequests(pullRequests);
+      setGithubPullMessage(`Loaded ${pullRequests.length} open agent pull request(s).`);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function updateGithubPullRequest(number: number, action: "approve" | "close") {
+    const label = action === "approve" ? "approve" : "close";
+    const confirmed = window.confirm(`Confirm that you want to ${label} pull request #${number}.`);
+    if (!confirmed) return;
+
+    setBusy(`github-pr-${action}-${number}`);
+    setError(null);
+    try {
+      if (!selectedGithubRepo) throw new Error("Select an installed GitHub repository first.");
+      const response = await fetch("/api/github/pulls/actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          installationId: selectedGithubRepo.installationId,
+          repoFullName: selectedGithubRepo.fullName,
+          number,
+          action,
+          confirmation: action
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error || `Could not ${action} pull request.`);
+      setGithubPullMessage(data.summary || `Pull request #${number} updated.`);
+      setToolOutput({
+        status: "completed",
+        summary: data.summary || `Pull request #${number} updated.`,
+        data
+      });
+      setGithubPullRequests(await fetchGithubPullRequestsForSelected());
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function loadGithubRepositories() {
     setBusy("github-repos");
     setError(null);
@@ -201,7 +286,7 @@ export default function Home() {
       setGithubInstallUrl(data.installUrl || "/api/github/install");
       setGithubRepos(repositories);
       if (!githubRepoFullName && repositories[0]?.fullName) {
-        setGithubRepoFullName(repositories[0].fullName);
+        selectGithubRepo(repositories[0].fullName);
       }
       setToolOutput({
         status: "completed",
@@ -316,13 +401,17 @@ export default function Home() {
                 githubInstallUrl={githubInstallUrl}
                 githubRepos={githubRepos}
                 githubRepoFullName={githubRepoFullName}
-                setGithubRepoFullName={setGithubRepoFullName}
+                setGithubRepoFullName={selectGithubRepo}
                 githubPrompt={githubPrompt}
                 setGithubPrompt={setGithubPrompt}
                 loadGithubRepositories={loadGithubRepositories}
+                loadGithubPullRequests={loadGithubPullRequests}
+                updateGithubPullRequest={updateGithubPullRequest}
                 runGithubAgent={runGithubAgent}
                 busy={busy}
                 githubResult={githubResult}
+                githubPullRequests={githubPullRequests}
+                githubPullMessage={githubPullMessage}
               />
             )}
 
@@ -419,9 +508,13 @@ function GithubAgentPanel({
   githubPrompt,
   setGithubPrompt,
   loadGithubRepositories,
+  loadGithubPullRequests,
+  updateGithubPullRequest,
   runGithubAgent,
   busy,
-  githubResult
+  githubResult,
+  githubPullRequests,
+  githubPullMessage
 }: {
   githubInstallUrl: string;
   githubRepos: GitHubRepository[];
@@ -430,9 +523,13 @@ function GithubAgentPanel({
   githubPrompt: string;
   setGithubPrompt: (value: string) => void;
   loadGithubRepositories: () => void;
+  loadGithubPullRequests: () => void;
+  updateGithubPullRequest: (number: number, action: "approve" | "close") => void;
   runGithubAgent: () => void;
   busy: string | null;
   githubResult: GitHubTaskResult | null;
+  githubPullRequests: GitHubPullRequest[];
+  githubPullMessage: string;
 }) {
   return (
     <section className="panel stack">
@@ -472,6 +569,53 @@ function GithubAgentPanel({
         )}
       </div>
       <pre className="chat-output">{githubResult?.text || "No GitHub agent result yet."}</pre>
+
+      <div className="divider" />
+
+      <div className="section-header">
+        <h3>Open Agent Pull Requests</h3>
+        <button disabled={busy === "github-pulls" || !githubRepoFullName} onClick={loadGithubPullRequests}>
+          Refresh
+        </button>
+      </div>
+      <span className="hint">
+        Actions require browser confirmation and are submitted by the GitHub App identity.
+      </span>
+      {githubPullMessage ? <div className="statusline">{githubPullMessage}</div> : null}
+      {githubPullRequests.length === 0 ? (
+        <div className="muted">No open agent pull requests loaded.</div>
+      ) : (
+        <div className="pr-list">
+          {githubPullRequests.map((pullRequest) => (
+            <article className="pr-card" key={pullRequest.id}>
+              <div className="pr-main">
+                <a href={pullRequest.htmlUrl} target="_blank" rel="noreferrer">
+                  #{pullRequest.number} {pullRequest.title}
+                </a>
+                <div className="pr-meta">
+                  {pullRequest.headRef} → {pullRequest.baseRef}
+                  {pullRequest.draft ? " · draft" : ""} · updated {formatRelativeDate(pullRequest.updatedAt)}
+                </div>
+              </div>
+              <div className="pr-actions">
+                <button
+                  disabled={busy === `github-pr-approve-${pullRequest.number}`}
+                  onClick={() => updateGithubPullRequest(pullRequest.number, "approve")}
+                >
+                  Approve
+                </button>
+                <button
+                  className="danger"
+                  disabled={busy === `github-pr-close-${pullRequest.number}`}
+                  onClick={() => updateGithubPullRequest(pullRequest.number, "close")}
+                >
+                  Close
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -497,4 +641,18 @@ function ToolEvents({ events }: { events: AgentToolEvent[] }) {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
+}
+
+function formatRelativeDate(value: string): string {
+  if (!value) return "unknown";
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return value;
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }

@@ -74,6 +74,10 @@ GITHUB_APP_SLUG
 GITHUB_APP_INSTALL_URL
 ```
 
+The GitHub App needs **Pull requests: Read and write** for listing PRs,
+creating PRs, closing PRs, and submitting approval reviews. Keep branch
+protection on the default branch so the app still cannot bypass your merge rules.
+
 The private key should live in:
 
 ```text
@@ -110,8 +114,16 @@ token, and opens a pull request against the repository default branch. If no
 non-empty file changes are produced, it returns the agent response without
 opening a pull request.
 
-The agent does not approve or merge pull requests. Protect `main` or your default
-branch with GitHub rulesets if you want GitHub itself to enforce PR-only changes.
+The GitHub tab can also refresh open agent pull requests for the selected
+repository. It only shows PRs that look agent-created, such as `agent/*` branches
+or `Agent:` titles. From the web UI you can approve or close one of those PRs
+after an explicit browser confirmation. The approval is submitted by the GitHub
+App identity, so repository branch-protection rules determine whether that
+approval counts.
+
+Prompt-running agent tasks do not approve or merge pull requests automatically.
+Protect `main` or your default branch with GitHub rulesets if you want GitHub
+itself to enforce PR-only changes and review requirements.
 
 ### Public URL Analysis
 

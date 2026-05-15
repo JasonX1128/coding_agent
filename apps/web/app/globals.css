@@ -70,6 +70,15 @@ button.primary:hover {
   background: var(--accent-strong);
 }
 
+button.danger {
+  border-color: #f0b4ae;
+  color: var(--danger);
+}
+
+button.danger:hover {
+  background: #fff1f0;
+}
+
 button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
@@ -225,6 +234,22 @@ pre {
   flex: 0 0 auto;
 }
 
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.section-header h3 {
+  margin: 0;
+}
+
+.divider {
+  border-top: 1px solid var(--border);
+  margin: 4px 0;
+}
+
 .two {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -287,6 +312,52 @@ pre {
   font-size: 13px;
 }
 
+.pr-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pr-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fbfdff;
+  padding: 10px;
+}
+
+.pr-main {
+  min-width: 0;
+}
+
+.pr-main a {
+  display: block;
+  overflow: hidden;
+  color: var(--accent-strong);
+  font-weight: 650;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pr-meta {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pr-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
 .chat-output {
   min-height: 140px;
 }
@@ -319,5 +390,13 @@ pre {
 
   .two {
     grid-template-columns: 1fr;
+  }
+
+  .pr-card {
+    grid-template-columns: 1fr;
+  }
+
+  .pr-actions {
+    justify-content: flex-start;
   }
 }

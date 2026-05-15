@@ -21,6 +21,21 @@ export type GitHubRepository = {
   htmlUrl: string;
 };
 
+export type GitHubPullRequest = {
+  id: number;
+  number: number;
+  title: string;
+  state: string;
+  draft: boolean;
+  htmlUrl: string;
+  authorLogin: string;
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type InstallationToken = {
   token: string;
   expiresAt: string;
@@ -179,6 +194,77 @@ export async function openPullRequest({
   };
 }
 
+export async function listOpenAgentPullRequests({
+  installationId,
+  repoFullName
+}: {
+  installationId: number;
+  repoFullName: string;
+}): Promise<GitHubPullRequest[]> {
+  const installationToken = await createInstallationToken(installationId);
+  const pullRequests: GitHubPullRequest[] = [];
+  let page = 1;
+
+  while (true) {
+    const data = await githubRequest<Array<Record<string, unknown>>>(
+      `/repos/${repoFullName}/pulls?state=open&sort=updated&direction=desc&per_page=100&page=${page}`,
+      { token: installationToken.token }
+    );
+    pullRequests.push(...data.filter(isAgentPullRequest).map(normalizePullRequest));
+    if (data.length < 100) break;
+    page += 1;
+  }
+
+  return pullRequests;
+}
+
+export async function closePullRequest({
+  installationId,
+  repoFullName,
+  number
+}: {
+  installationId: number;
+  repoFullName: string;
+  number: number;
+}): Promise<GitHubPullRequest> {
+  const installationToken = await createInstallationToken(installationId);
+  await assertAgentPullRequest(installationToken.token, repoFullName, number);
+  const data = await githubRequest<Record<string, unknown>>(`/repos/${repoFullName}/pulls/${number}`, {
+    method: "PATCH",
+    token: installationToken.token,
+    body: { state: "closed" }
+  });
+  return normalizePullRequest(data);
+}
+
+export async function approvePullRequest({
+  installationId,
+  repoFullName,
+  number
+}: {
+  installationId: number;
+  repoFullName: string;
+  number: number;
+}): Promise<{ id: number; state: string; submittedAt?: string; htmlUrl?: string }> {
+  const installationToken = await createInstallationToken(installationId);
+  await assertAgentPullRequest(installationToken.token, repoFullName, number);
+  const data = await githubRequest<Record<string, unknown>>(`/repos/${repoFullName}/pulls/${number}/reviews`, {
+    method: "POST",
+    token: installationToken.token,
+    body: {
+      event: "APPROVE",
+      body: "Approved from the Coding Agent web UI after explicit user confirmation."
+    }
+  });
+
+  return {
+    id: requiredNumber(data.id, "review id"),
+    state: typeof data.state === "string" ? data.state : "APPROVED",
+    submittedAt: typeof data.submitted_at === "string" ? data.submitted_at : undefined,
+    htmlUrl: typeof data.html_url === "string" ? data.html_url : undefined
+  };
+}
+
 export async function githubRequest<T>(
   route: string,
   options: {
@@ -258,6 +344,49 @@ function normalizeInstallation(installation: Record<string, unknown>): StoredIns
     accountType: typeof account.type === "string" ? account.type : undefined,
     updatedAt: new Date().toISOString()
   };
+}
+
+function normalizePullRequest(pullRequest: Record<string, unknown>): GitHubPullRequest {
+  const head = pullRequest.head && typeof pullRequest.head === "object"
+    ? (pullRequest.head as Record<string, unknown>)
+    : {};
+  const base = pullRequest.base && typeof pullRequest.base === "object"
+    ? (pullRequest.base as Record<string, unknown>)
+    : {};
+  const user = pullRequest.user && typeof pullRequest.user === "object"
+    ? (pullRequest.user as Record<string, unknown>)
+    : {};
+  return {
+    id: requiredNumber(pullRequest.id, "pull request id"),
+    number: requiredNumber(pullRequest.number, "pull request number"),
+    title: requiredString(pullRequest.title, "pull request title"),
+    state: typeof pullRequest.state === "string" ? pullRequest.state : "unknown",
+    draft: Boolean(pullRequest.draft),
+    htmlUrl: requiredString(pullRequest.html_url, "pull request html_url"),
+    authorLogin: typeof user.login === "string" ? user.login : "",
+    headRef: typeof head.ref === "string" ? head.ref : "",
+    headSha: typeof head.sha === "string" ? head.sha : "",
+    baseRef: typeof base.ref === "string" ? base.ref : "",
+    createdAt: typeof pullRequest.created_at === "string" ? pullRequest.created_at : "",
+    updatedAt: typeof pullRequest.updated_at === "string" ? pullRequest.updated_at : ""
+  };
+}
+
+function isAgentPullRequest(pullRequest: Record<string, unknown>): boolean {
+  const title = typeof pullRequest.title === "string" ? pullRequest.title : "";
+  const body = typeof pullRequest.body === "string" ? pullRequest.body : "";
+  const head = pullRequest.head && typeof pullRequest.head === "object"
+    ? (pullRequest.head as Record<string, unknown>)
+    : {};
+  const headRef = typeof head.ref === "string" ? head.ref : "";
+  return headRef.startsWith("agent/") || title.startsWith("Agent:") || body.includes("created from an `agent/*` branch");
+}
+
+async function assertAgentPullRequest(token: string, repoFullName: string, number: number): Promise<void> {
+  const pullRequest = await githubRequest<Record<string, unknown>>(`/repos/${repoFullName}/pulls/${number}`, { token });
+  if (!isAgentPullRequest(pullRequest)) {
+    throw new Error(`Pull request #${number} does not look like an agent-created pull request.`);
+  }
 }
 
 function requiredString(value: unknown, label: string): string {
