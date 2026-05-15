@@ -108,6 +108,21 @@ const daemonTools = [
     }
   },
   {
+    name: "create_file",
+    description: "Create a text file with exact content. Use this for new simple files instead of shell commands.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        content: { type: "string" },
+        overwrite: { type: "boolean", description: "Set true only when intentionally replacing an existing file." },
+        allowEmpty: { type: "boolean", description: "Set true only when an empty file is explicitly requested." }
+      },
+      required: ["path", "content"],
+      additionalProperties: false
+    }
+  },
+  {
     name: "apply_patch",
     description: "Apply a unified diff patch to the workspace.",
     inputSchema: {

@@ -83,7 +83,7 @@ async function createSandboxRoot(): Promise<string> {
 
 function createSandboxExecutor(rootPath: string): ToolExecutor {
   return async (name: DaemonToolName, args: Record<string, unknown>) => {
-    if (name === "apply_patch" || name === "run_command") {
+    if (name === "create_file" || name === "apply_patch" || name === "run_command") {
       return toolResult("requires_approval", `${name} is disabled for GitHub analysis mode in this MVP.`, undefined, "medium");
     }
 

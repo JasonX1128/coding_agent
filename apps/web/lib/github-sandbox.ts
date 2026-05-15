@@ -3,6 +3,7 @@ import type {
   AgentProvider,
   AgentRunResponse,
   CommandResult,
+  CreateFileResult,
   DaemonToolName,
   GitResult,
   ListFilesResult,
@@ -12,7 +13,7 @@ import type {
   ToolResult
 } from "@coding-agent/shared";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import {
@@ -70,18 +71,19 @@ export async function runGitHubPrTask(request: GitHubPrTaskRequest): Promise<Git
   });
 
   const changedFiles = await changedFileNames(rootPath);
-  if (changedFiles.length === 0) {
+  const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
+  if (committableFiles.length === 0) {
     return {
       ...result,
       repository: repo.fullName,
       branchName,
-      changedFiles,
+      changedFiles: committableFiles,
       sandboxRoot,
-      text: `${result.text}\n\nNo file changes were produced, so no pull request was opened.`
+      text: `${result.text}\n\nNo non-empty file changes were produced, so no pull request was opened.`
     };
   }
 
-  await runRequired("git", ["add", "-A"], rootPath, 20_000);
+  await runRequired("git", ["add", "-A", "--", ...committableFiles], rootPath, 20_000);
   await runRequired("git", ["commit", "-m", commitTitle(request.prompt)], rootPath, 60_000);
   await runRequired(
     "git",
@@ -95,7 +97,7 @@ export async function runGitHubPrTask(request: GitHubPrTaskRequest): Promise<Git
     installationId: repo.installationId,
     repoFullName: repo.fullName,
     title: prTitle(request.prompt),
-    body: prBody(request.prompt, result, changedFiles),
+    body: prBody(request.prompt, result, committableFiles),
     head: branchName,
     base: repo.defaultBranch
   });
@@ -106,7 +108,7 @@ export async function runGitHubPrTask(request: GitHubPrTaskRequest): Promise<Git
     branchName,
     pullRequestUrl: pullRequest.htmlUrl,
     pullRequestNumber: pullRequest.number,
-    changedFiles,
+    changedFiles: committableFiles,
     sandboxRoot
   };
 }
@@ -119,6 +121,7 @@ function createWritableSandboxExecutor(rootPath: string): ToolExecutor {
       if (name === "search_text") return searchTool(rootPath, args);
       if (name === "git_status") return gitTool(rootPath, "status");
       if (name === "git_diff") return gitTool(rootPath, "diff");
+      if (name === "create_file") return createFileTool(rootPath, args);
       if (name === "apply_patch") return applyPatchTool(rootPath, args);
       if (name === "run_command") return runCommandTool(rootPath, args);
       return toolResult("failed", `Unsupported tool: ${name}`);
@@ -197,6 +200,30 @@ async function applyPatchTool(rootPath: string, args: Record<string, unknown>): 
   return toolResult("completed", `Applied patch to ${changedFiles.length} file(s).`, { changedFiles });
 }
 
+async function createFileTool(rootPath: string, args: Record<string, unknown>): Promise<ToolResult<CreateFileResult>> {
+  const requestedPath = typeof args.path === "string" ? args.path : "";
+  const content = typeof args.content === "string" ? args.content : "";
+  const overwrite = args.overwrite === true;
+  const allowEmpty = args.allowEmpty === true;
+
+  if (!requestedPath) return toolResult<CreateFileResult>("failed", "Missing file path.");
+  if (!allowEmpty && content.length === 0) {
+    return toolResult<CreateFileResult>("failed", "Refusing to create an empty file without allowEmpty=true.");
+  }
+
+  const absolutePath = await resolveSandboxPath(rootPath, requestedPath);
+  if (existsSync(absolutePath) && !overwrite) {
+    return toolResult<CreateFileResult>("failed", "File already exists. Use apply_patch for edits, or overwrite=true only when replacing it intentionally.");
+  }
+
+  await mkdir(path.dirname(absolutePath), { recursive: true });
+  await writeFile(absolutePath, content, "utf8");
+  return toolResult("completed", `Created ${requestedPath}.`, {
+    path: requestedPath,
+    bytes: Buffer.byteLength(content, "utf8")
+  });
+}
+
 async function runCommandTool(rootPath: string, args: Record<string, unknown>): Promise<ToolResult<CommandResult>> {
   const command = typeof args.command === "string" ? args.command : "";
   if (!command) return toolResult<CommandResult>("failed", "Missing command.");
@@ -272,6 +299,26 @@ async function changedFileNames(rootPath: string): Promise<string[]> {
   return [...new Set([...diff.stdout.split(/\r?\n/), ...staged.stdout.split(/\r?\n/), ...untracked.stdout.split(/\r?\n/)].filter(Boolean))];
 }
 
+async function committableChangedFileNames(rootPath: string, changedFiles: string[]): Promise<string[]> {
+  const result: string[] = [];
+  for (const file of changedFiles) {
+    const absolutePath = await resolveSandboxPath(rootPath, file);
+    if (!existsSync(absolutePath)) {
+      result.push(file);
+      continue;
+    }
+    const info = await stat(absolutePath);
+    if (info.isDirectory()) continue;
+    if (info.size > 0 || await isTracked(rootPath, file)) result.push(file);
+  }
+  return result;
+}
+
+async function isTracked(rootPath: string, file: string): Promise<boolean> {
+  const result = await runProcess("git", ["ls-files", "--error-unmatch", "--", file], rootPath, 20_000);
+  return result.exitCode === 0;
+}
+
 async function runRequired(command: string, args: string[], cwd: string, timeoutMs: number, secret?: string): Promise<void> {
   const result = await runProcess(command, args, cwd, timeoutMs, undefined, false, secret);
   if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || `${command} failed`);
@@ -337,7 +384,10 @@ function buildPrPrompt(repoFullName: string, defaultBranch: string, branchName: 
     "",
     "You are running in a disposable GitHub App sandbox.",
     "Make only the changes needed for the user's request.",
-    "Use apply_patch for file edits.",
+    "Use create_file for new text files and apply_patch for edits to existing files.",
+    "Do not use run_command to create or edit files.",
+    "Do not use touch, echo, cat, tee, heredocs, or shell redirection for file edits.",
+    "Before finishing, ensure any new file requested by the user has non-empty content.",
     "Do not approve, merge, or push directly to the base branch.",
     "Run relevant tests if they are obvious and reasonably cheap.",
     "",
@@ -390,6 +440,7 @@ function prBody(prompt: string, result: AgentRunResponse, changedFiles: string[]
 function scoreCommandRisk(command: string): "low" | "medium" | "high" {
   const lower = command.toLowerCase();
   if (/(^|\s)(sudo|rm|dd|mkfs|chmod|chown|curl|wget|ssh|scp)\b/.test(lower)) return "high";
+  if (/(^|\s)(touch|truncate|tee)\b/.test(lower)) return "high";
   if (/(^|\s)git\s+(push|checkout|reset|clean|merge|rebase)\b/.test(lower)) return "high";
   if (/[|;&`$<>]/.test(command)) return "high";
   if (/(^|\s)(npm|pnpm|yarn|bun)\s+(install|add|remove)\b/.test(lower)) return "medium";

@@ -11,6 +11,7 @@ import type {
   GitResult,
   ListFilesResult,
   PatchResult,
+  CreateFileResult,
   ReadFileResult,
   SearchResult,
   ToolResult,
@@ -216,6 +217,35 @@ server.post("/tools/apply_patch", async (request, reply) => {
   return result;
 });
 
+server.post("/tools/create_file", async (request, reply) => {
+  const body = z
+    .object({
+      workspaceId: z.string(),
+      path: z.string().min(1),
+      content: z.string(),
+      overwrite: z.boolean().optional().default(false),
+      allowEmpty: z.boolean().optional().default(false)
+    })
+    .parse(request.body);
+
+  if (!body.allowEmpty && body.content.length === 0) {
+    return reply.code(400).send(toolResult<CreateFileResult>("failed", "Refusing to create an empty file without allowEmpty=true."));
+  }
+
+  const workspace = getWorkspace(body.workspaceId);
+  const absolutePath = await resolveWorkspacePath(workspace, body.path);
+  if (existsSync(absolutePath) && !body.overwrite) {
+    return reply.code(409).send(toolResult<CreateFileResult>("failed", "File already exists. Use overwrite=true only when replacing it intentionally."));
+  }
+
+  await mkdir(path.dirname(absolutePath), { recursive: true });
+  await writeFile(absolutePath, body.content, "utf8");
+  return toolResult<CreateFileResult>("completed", `Created ${body.path}.`, {
+    path: body.path,
+    bytes: Buffer.byteLength(body.content, "utf8")
+  });
+});
+
 server.post("/tools/run_command", async (request, reply) => {
   const body = z
     .object({
@@ -393,6 +423,7 @@ function cleanPatchFileName(fileName?: string): string | undefined {
 function scoreCommandRisk(command: string): "low" | "medium" | "high" {
   const lower = command.toLowerCase();
   if (/(^|\s)(sudo|rm|dd|mkfs|chmod|chown|curl|wget|ssh|scp)\b/.test(lower)) return "high";
+  if (/(^|\s)(touch|truncate|tee)\b/.test(lower)) return "high";
   if (/(^|\s)git\s+push\b/.test(lower)) return "high";
   if (/[|;&`$<>]/.test(command)) return "high";
   if (/(^|\s)(npm|pnpm|yarn|bun)\s+(install|add|remove)\b/.test(lower)) return "medium";

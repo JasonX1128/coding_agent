@@ -69,6 +69,11 @@ export type PatchResult = {
   changedFiles: string[];
 };
 
+export type CreateFileResult = {
+  path: string;
+  bytes: number;
+};
+
 export type CommandResult = {
   command: string;
   exitCode: number | null;
@@ -83,5 +88,6 @@ export type DaemonToolName =
   | "search_text"
   | "git_status"
   | "git_diff"
+  | "create_file"
   | "apply_patch"
   | "run_command";
