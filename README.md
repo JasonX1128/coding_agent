@@ -35,8 +35,17 @@ Supported provider environment variables:
 OPENAI_API_KEY
 ANTHROPIC_API_KEY
 GEMINI_API_KEY
+GOOGLE_MODEL
+GOOGLE_BACKUP_MODEL
+GOOGLE_LAST_RESORT_MODEL
 GROQ_API_KEY
 ```
+
+The Google adapter defaults to `gemini-3.1-flash-lite` and falls back to
+`gemma-4-31b-it` if the primary Google model request fails before any local tool
+side effects occur. It also keeps `gemini-2.5-flash-lite` as a final safety net
+because provider-side availability can differ by key and model version. Override
+those with `GOOGLE_MODEL`, `GOOGLE_BACKUP_MODEL`, and `GOOGLE_LAST_RESORT_MODEL`.
 
 ## Local Workspace Flow
 
