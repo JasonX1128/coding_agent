@@ -56,10 +56,65 @@ those with `GOOGLE_MODEL`, `GOOGLE_BACKUP_MODEL`, and `GOOGLE_LAST_RESORT_MODEL`
 
 ## GitHub Repo Flow
 
-The GitHub panel accepts a GitHub repository URL such as:
+The GitHub tab supports two flows:
+
+1. GitHub App PR flow for installed repositories.
+2. Legacy public-URL analysis through `/api/github-agent`.
+
+### GitHub App PR Flow
+
+Create and install a GitHub App, then set:
+
+```text
+GITHUB_APP_ID
+GITHUB_APP_CLIENT_ID
+GITHUB_APP_CLIENT_SECRET
+GITHUB_APP_PRIVATE_KEY_PATH
+GITHUB_APP_SLUG
+GITHUB_APP_INSTALL_URL
+```
+
+The private key should live in:
+
+```text
+.secrets/github-app-private-key.pem
+```
+
+Run the app:
+
+```bash
+set -a
+source .env
+set +a
+npm run dev
+```
+
+Then:
+
+1. Open `http://localhost:3000`.
+2. Select the GitHub tab.
+3. Click **Install App** if the app is not installed yet.
+4. Click **Load Repositories**.
+5. Select an installed repository.
+6. Enter a prompt that asks for a concrete file change.
+7. Click **Open Pull Request**.
+
+The app clones the repository into `.agent-sandboxes/`, creates an `agent/*`
+branch, runs the agent with file/search/patch/git/command tools, commits any
+changes, pushes the branch with a short-lived installation token, and opens a
+pull request against the repository default branch.
+
+The agent does not approve or merge pull requests. Protect `main` or your default
+branch with GitHub rulesets if you want GitHub itself to enforce PR-only changes.
+
+### Public URL Analysis
+
+The legacy route at `/api/github-agent` accepts a public GitHub URL such as:
 
 ```text
 https://github.com/vercel/next.js
 ```
 
-For the MVP, the web route clones public repositories locally under `.agent-sandboxes/` and runs the same agent tool loop against the clone. Private repository support can use `GITHUB_TOKEN` during local development. Production should use the GitHub App flow described in the plan.
+It clones public repositories locally under `.agent-sandboxes/` and runs the same
+agent read/search loop against the clone. Private repository support for this
+legacy route can use `GITHUB_TOKEN`, but the GitHub App flow is preferred.

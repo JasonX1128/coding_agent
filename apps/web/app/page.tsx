@@ -19,6 +19,24 @@ type ToolPayload = {
   error?: string;
 };
 
+type GitHubRepository = {
+  id: number;
+  installationId: number;
+  fullName: string;
+  private: boolean;
+  defaultBranch: string;
+  htmlUrl: string;
+};
+
+type GitHubPrResult = AgentRunResponse & {
+  repository?: string;
+  branchName?: string;
+  pullRequestUrl?: string;
+  pullRequestNumber?: number;
+  changedFiles?: string[];
+  sandboxRoot?: string;
+};
+
 export default function Home() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("local");
   const [daemonOrigin, setDaemonOrigin] = useState(DEFAULT_DAEMON_ORIGIN);
@@ -35,15 +53,21 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState("agent");
   const [command, setCommand] = useState("npm run typecheck");
   const [patch, setPatch] = useState("");
-  const [githubRepoUrl, setGithubRepoUrl] = useState("https://github.com/octocat/Hello-World");
-  const [githubPrompt, setGithubPrompt] = useState("Inspect this repository and summarize its structure.");
-  const [githubResult, setGithubResult] = useState<(AgentRunResponse & { repository?: string; sandboxRoot?: string }) | null>(null);
+  const [githubInstallUrl, setGithubInstallUrl] = useState("/api/github/install");
+  const [githubRepos, setGithubRepos] = useState<GitHubRepository[]>([]);
+  const [githubRepoFullName, setGithubRepoFullName] = useState("");
+  const [githubPrompt, setGithubPrompt] = useState("Make a small README update that explains this repo was touched by the coding agent.");
+  const [githubResult, setGithubResult] = useState<GitHubPrResult | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const selectedWorkspace = useMemo(
     () => workspaces.find((workspace) => workspace.id === workspaceId),
     [workspaceId, workspaces]
+  );
+  const selectedGithubRepo = useMemo(
+    () => githubRepos.find((repo) => repo.fullName === githubRepoFullName),
+    [githubRepoFullName, githubRepos]
   );
 
   async function connectDaemon() {
@@ -142,11 +166,13 @@ export default function Home() {
     setError(null);
     setGithubResult(null);
     try {
-      const response = await fetch("/api/github-agent", {
+      if (!selectedGithubRepo) throw new Error("Select an installed GitHub repository first.");
+      const response = await fetch("/api/github/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          repoUrl: githubRepoUrl,
+          installationId: selectedGithubRepo.installationId,
+          repoFullName: selectedGithubRepo.fullName,
           prompt: githubPrompt,
           provider,
           model: model || undefined
@@ -155,6 +181,31 @@ export default function Home() {
       const data = await response.json();
       if (!response.ok) throw new Error(data?.error || "GitHub agent request failed.");
       setGithubResult(data);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function loadGithubRepositories() {
+    setBusy("github-repos");
+    setError(null);
+    try {
+      const response = await fetch("/api/github/repositories");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error || "Could not load GitHub repositories.");
+      const repositories = Array.isArray(data.repositories) ? data.repositories : [];
+      setGithubInstallUrl(data.installUrl || "/api/github/install");
+      setGithubRepos(repositories);
+      if (!githubRepoFullName && repositories[0]?.fullName) {
+        setGithubRepoFullName(repositories[0].fullName);
+      }
+      setToolOutput({
+        status: "completed",
+        summary: `Loaded ${repositories.length} GitHub repositories available to the app.`,
+        data
+      });
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -260,10 +311,13 @@ export default function Home() {
               />
             ) : (
               <GithubAgentPanel
-                githubRepoUrl={githubRepoUrl}
-                setGithubRepoUrl={setGithubRepoUrl}
+                githubInstallUrl={githubInstallUrl}
+                githubRepos={githubRepos}
+                githubRepoFullName={githubRepoFullName}
+                setGithubRepoFullName={setGithubRepoFullName}
                 githubPrompt={githubPrompt}
                 setGithubPrompt={setGithubPrompt}
+                loadGithubRepositories={loadGithubRepositories}
                 runGithubAgent={runGithubAgent}
                 busy={busy}
                 githubResult={githubResult}
@@ -356,32 +410,64 @@ function LocalAgentPanel({
 }
 
 function GithubAgentPanel({
-  githubRepoUrl,
-  setGithubRepoUrl,
+  githubInstallUrl,
+  githubRepos,
+  githubRepoFullName,
+  setGithubRepoFullName,
   githubPrompt,
   setGithubPrompt,
+  loadGithubRepositories,
   runGithubAgent,
   busy,
   githubResult
 }: {
-  githubRepoUrl: string;
-  setGithubRepoUrl: (value: string) => void;
+  githubInstallUrl: string;
+  githubRepos: GitHubRepository[];
+  githubRepoFullName: string;
+  setGithubRepoFullName: (value: string) => void;
   githubPrompt: string;
   setGithubPrompt: (value: string) => void;
+  loadGithubRepositories: () => void;
   runGithubAgent: () => void;
   busy: string | null;
-  githubResult: (AgentRunResponse & { repository?: string; sandboxRoot?: string }) | null;
+  githubResult: GitHubPrResult | null;
 }) {
   return (
     <section className="panel stack">
-      <h2>GitHub Agent</h2>
-      <input value={githubRepoUrl} onChange={(event) => setGithubRepoUrl(event.target.value)} />
+      <h2>GitHub PR Agent</h2>
+      <div className="row">
+        <a className="button-link" href={githubInstallUrl}>
+          Install App
+        </a>
+        <button disabled={busy === "github-repos"} onClick={loadGithubRepositories}>
+          Load Repositories
+        </button>
+      </div>
+      <label className="stack">
+        <span className="hint">Installed repository</span>
+        <select value={githubRepoFullName} onChange={(event) => setGithubRepoFullName(event.target.value)}>
+          {githubRepos.length === 0 ? <option value="">No repositories loaded</option> : null}
+          {githubRepos.map((repo) => (
+            <option key={`${repo.installationId}:${repo.id}`} value={repo.fullName}>
+              {repo.fullName} · {repo.defaultBranch}{repo.private ? " · private" : ""}
+            </option>
+          ))}
+        </select>
+      </label>
       <textarea rows={5} value={githubPrompt} onChange={(event) => setGithubPrompt(event.target.value)} />
-      <button className="primary" disabled={busy === "github-agent" || !githubRepoUrl.trim()} onClick={runGithubAgent}>
-        Analyze Repository
+      <button className="primary" disabled={busy === "github-agent" || !githubRepoFullName || !githubPrompt.trim()} onClick={runGithubAgent}>
+        Open Pull Request
       </button>
       <div className="statusline">
-        {githubResult?.repository ? `Repository: ${githubResult.repository}` : "Public GitHub repos work without extra setup."}
+        {githubResult?.pullRequestUrl ? (
+          <a href={githubResult.pullRequestUrl} target="_blank" rel="noreferrer">
+            Pull request #{githubResult.pullRequestNumber}: {githubResult.pullRequestUrl}
+          </a>
+        ) : githubResult?.repository ? (
+          `Repository: ${githubResult.repository}`
+        ) : (
+          "Install the GitHub App, load repositories, then select one to create an agent PR."
+        )}
       </div>
       <pre className="chat-output">{githubResult?.text || "No GitHub agent result yet."}</pre>
     </section>
