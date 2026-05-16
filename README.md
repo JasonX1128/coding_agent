@@ -61,6 +61,9 @@ ANTHROPIC_REVIEW_MODEL
 GOOGLE_REVIEW_MODEL
 GROQ_REVIEW_MODEL
 GITHUB_WRITE_MAX_TOOL_ROUNDS
+GITHUB_REVIEW_REPAIR_ATTEMPTS
+GITHUB_AUTOPILOT_REVIEW_REPAIR_ATTEMPTS
+GITHUB_REVIEW_REPAIR_TOOL_ROUNDS
 ```
 
 The Google adapter queries model candidates in strength order by default:
@@ -159,17 +162,25 @@ commands inside the disposable GitHub sandbox, and opens a PR when non-empty
 changes exist even if validation or the reviewer gate raises warnings. It still
 does not approve, merge, or push directly to the repository default branch.
 Autopilot warnings are written into the PR body and returned in the run result.
+Autopilot defaults to four reviewer repair attempts before it gives up and opens
+the PR anyway. Normal write runs default to two repair attempts before pausing
+for a human decision.
 
 Coding prompts use a structured delivery loop: derive an implementation plan and
 acceptance criteria, inspect the owning files, implement against those criteria,
 inspect the diff, run relevant validation, and summarize which criteria were
 satisfied. The GitHub flow now records lifecycle events, validation checks, and
 acceptance criteria as structured run state. Before opening a PR, a tool-disabled
-reviewer pass evaluates the diff against the original request and pauses the run
-when validation fails or the reviewer finds unmet criteria. Set
+reviewer pass evaluates the diff against the original request. If validation or
+review fails, the agent receives the reviewer findings and current diff for a
+focused repair pass, then repeats review until approved or the repair attempt
+budget is exhausted. Set
 `GITHUB_REVIEW_MODEL` or a provider-specific override such as
 `GOOGLE_REVIEW_MODEL` to use a different model for that reviewer gate. Passing
 typecheck alone is not treated as proof that a broad feature request is complete.
+The workflow also runs deterministic static awareness checks for changed
+JavaScript and TypeScript files, including bare React hook calls that no longer
+have matching `react` imports.
 
 The GitHub tab can also refresh open agent pull requests for the selected
 repository. It only shows PRs that look agent-created, such as `agent/*` branches

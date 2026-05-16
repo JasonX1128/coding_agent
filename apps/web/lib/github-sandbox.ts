@@ -158,7 +158,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
 
   result = withAutopilotMetadata(enrichAgentRunResult(result, collectedToolEvents), autopilot, autopilotWarnings);
   const changedFiles = await changedFileNames(rootPath);
-  const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
+  let committableFiles = await committableChangedFileNames(rootPath, changedFiles);
   const immediatePauseReason = mode === "write" ? immediatePauseReasonForResult(result) : undefined;
   if (mode === "read") {
     return {
@@ -212,23 +212,40 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     };
   }
 
-  await emitLifecycleEvent(request.onLifecycleEvent, "validating", "Summarizing validation feedback from the run.");
-  const review = await reviewGitHubRun({
+  const quality = await runReviewRepairLoop({
     provider: request.provider,
     model: request.model,
     repoFullName: repo.fullName,
     prompt: request.prompt,
     rootPath,
     result,
-    changedFiles: committableFiles
+    changedFiles: committableFiles,
+    executor,
+    collectedToolEvents,
+    autopilot,
+    autopilotWarnings,
+    onLifecycleEvent: request.onLifecycleEvent,
+    onToolStart: request.onToolStart,
+    onToolEvent: request.onToolEvent
   });
-  result = withReviewResult(result, review);
-  await emitLifecycleEvent(
-    request.onLifecycleEvent,
-    "reviewing",
-    review.status === "approved" ? "Reviewer gate approved the proposed changes." : "Reviewer gate found issues that need a human or continuation.",
-    review.status === "approved" ? "completed" : "paused"
-  );
+  result = quality.result;
+  committableFiles = quality.changedFiles;
+
+  if (committableFiles.length === 0) {
+    return {
+      ...result,
+      repository: repo.fullName,
+      mode,
+      branchName,
+      changedFiles: committableFiles,
+      sandboxRoot,
+      status: autopilot ? "completed" : result.status,
+      lifecycleStatus: autopilot ? "completed" : result.lifecycleStatus,
+      autopilot,
+      autopilotWarnings,
+      text: `${result.text}\n\nNo non-empty file changes remained after review repair, so no pull request was opened.`
+    };
+  }
 
   const gatedPauseReason = pauseReasonForResult(result);
   if (gatedPauseReason && !autopilot) {
@@ -291,7 +308,9 @@ export async function resumeGitHubRepositoryTask({
   const record = await readPausedRun(pauseId);
   const rootPath = await realpath(record.sandboxRoot);
   const installationToken = await createInstallationToken(record.installationId);
-  const executor = createWritableSandboxExecutor(rootPath);
+  const autopilot = record.autopilot === true;
+  const autopilotWarnings = [...(record.autopilotWarnings || [])];
+  const executor = createWritableSandboxExecutor(rootPath, { allowHighRiskCommands: autopilot });
   const collectedToolEvents: AgentToolEvent[] = [...record.toolEvents];
   let result: AgentRunResponse;
 
@@ -315,9 +334,9 @@ export async function resumeGitHubRepositoryTask({
     await emitLifecycleEvent(onLifecycleEvent, "recovered", "Recovered from a provider error during continuation.", "failed");
   }
 
-  result = enrichAgentRunResult(result, collectedToolEvents, record);
+  result = withAutopilotMetadata(enrichAgentRunResult(result, collectedToolEvents, record), autopilot, autopilotWarnings);
   const changedFiles = await changedFileNames(rootPath);
-  const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
+  let committableFiles = await committableChangedFileNames(rootPath, changedFiles);
   if (committableFiles.length === 0) {
     await deletePausedRun(record.id, false);
     return {
@@ -332,7 +351,7 @@ export async function resumeGitHubRepositoryTask({
   }
 
   const immediatePauseReason = immediatePauseReasonForResult(result);
-  if (immediatePauseReason) {
+  if (immediatePauseReason && !autopilot) {
     await emitLifecycleEvent(onLifecycleEvent, "paused", `Paused before PR creation: ${pauseReasonLabel(immediatePauseReason)}.`, "paused");
     return pauseGitHubRun({
       installationId: record.installationId,
@@ -350,27 +369,47 @@ export async function resumeGitHubRepositoryTask({
       pauseId: record.id
     });
   }
+  if (immediatePauseReason && autopilot) {
+    autopilotWarnings.push(`Autopilot ignored checkpoint: ${pauseReasonLabel(immediatePauseReason)}.`);
+    result = withAutopilotMetadata(result, autopilot, autopilotWarnings);
+  }
 
-  await emitLifecycleEvent(onLifecycleEvent, "validating", "Summarizing validation feedback from the continuation.");
-  const review = await reviewGitHubRun({
+  const quality = await runReviewRepairLoop({
     provider: record.provider,
     model: record.model,
     repoFullName: record.repoFullName,
     prompt: record.prompt,
     rootPath,
     result,
-    changedFiles: committableFiles
-  });
-  result = withReviewResult({ ...result, toolEvents: collectedToolEvents }, review);
-  await emitLifecycleEvent(
+    changedFiles: committableFiles,
+    executor,
+    collectedToolEvents,
+    autopilot,
+    autopilotWarnings,
     onLifecycleEvent,
-    "reviewing",
-    review.status === "approved" ? "Reviewer gate approved the continued changes." : "Reviewer gate found issues that need another continuation or a human decision.",
-    review.status === "approved" ? "completed" : "paused"
-  );
+    onToolStart,
+    onToolEvent
+  });
+  result = quality.result;
+  committableFiles = quality.changedFiles;
+
+  if (committableFiles.length === 0) {
+    await deletePausedRun(record.id, false);
+    return {
+      ...result,
+      repository: record.repoFullName,
+      mode: record.mode,
+      branchName: record.branchName,
+      changedFiles: [],
+      sandboxRoot: rootPath,
+      autopilot,
+      autopilotWarnings,
+      text: `${result.text}\n\nNo non-empty file changes remained after review repair, so the paused run was closed without opening a pull request.`
+    };
+  }
 
   const gatedPauseReason = pauseReasonForResult(result);
-  if (gatedPauseReason) {
+  if (gatedPauseReason && !autopilot) {
     await emitLifecycleEvent(onLifecycleEvent, "needs_review", `Paused before PR creation: ${pauseReasonLabel(gatedPauseReason)}.`, "paused");
     return pauseGitHubRun({
       installationId: record.installationId,
@@ -388,8 +427,16 @@ export async function resumeGitHubRepositoryTask({
       pauseId: record.id
     });
   }
+  if (gatedPauseReason && autopilot) {
+    autopilotWarnings.push(`Autopilot ignored checkpoint: ${pauseReasonLabel(gatedPauseReason)}.`);
+    result = withAutopilotMetadata(result, autopilot, autopilotWarnings);
+  }
 
-  await emitLifecycleEvent(onLifecycleEvent, "opening_pr", "Opening a pull request for the reviewed continuation.");
+  await emitLifecycleEvent(
+    onLifecycleEvent,
+    "opening_pr",
+    autopilot ? "Opening a pull request in autopilot mode despite any remaining quality checkpoints." : "Opening a pull request for the reviewed continuation."
+  );
   const finalized = await finalizeGitHubRun({
     installationId: record.installationId,
     repoFullName: record.repoFullName,
@@ -401,7 +448,9 @@ export async function resumeGitHubRepositoryTask({
     result: { ...result, toolEvents: collectedToolEvents },
     changedFiles: committableFiles,
     mode: record.mode,
-    draft: false
+    draft: false,
+    autopilot,
+    autopilotWarnings
   });
   await deletePausedRun(record.id, false);
   return finalized;
@@ -456,7 +505,9 @@ export async function actOnPausedGitHubRun({
     },
     changedFiles,
     mode: record.mode,
-    draft: true
+    draft: true,
+    autopilot: record.autopilot,
+    autopilotWarnings: record.autopilotWarnings
   });
   await deletePausedRun(record.id, false);
   return finalized;
@@ -558,6 +609,11 @@ async function pauseGitHubRun({
 }): Promise<GitHubRepositoryTaskResult> {
   const id = pauseId || randomUUID();
   const diffSummary = await gitDiffSummary(sandboxRoot);
+  const resultMetadata = asRecord(result);
+  const autopilot = resultMetadata.autopilot === true;
+  const autopilotWarnings = Array.isArray(resultMetadata.autopilotWarnings)
+    ? resultMetadata.autopilotWarnings.filter((warning): warning is string => typeof warning === "string")
+    : [];
   const record: PausedGitHubRunRecord = {
     id,
     installationId,
@@ -578,7 +634,9 @@ async function pauseGitHubRun({
     diffSummary,
     acceptanceCriteria: result.acceptanceCriteria,
     validation: result.validation,
-    review: result.review
+    review: result.review,
+    autopilot,
+    autopilotWarnings
   };
   await writePausedRun(record);
 
@@ -599,6 +657,8 @@ async function pauseGitHubRun({
     acceptanceCriteria: result.acceptanceCriteria,
     validation: result.validation,
     review: result.review,
+    autopilot,
+    autopilotWarnings,
     text: [
       result.text,
       "",
@@ -624,7 +684,9 @@ function pausedActionResult(record: PausedGitHubRunRecord, message: string): Git
     mode: record.mode,
     branchName: record.branchName,
     changedFiles: record.changedFiles,
-    sandboxRoot: record.sandboxRoot
+    sandboxRoot: record.sandboxRoot,
+    autopilot: record.autopilot,
+    autopilotWarnings: record.autopilotWarnings
   };
 }
 
@@ -722,6 +784,322 @@ function validationChecksFromToolEvents(toolEvents: AgentToolEvent[], includeNot
   }];
 }
 
+async function runReviewRepairLoop({
+  provider,
+  model,
+  repoFullName,
+  prompt,
+  rootPath,
+  result: initialResult,
+  changedFiles: initialChangedFiles,
+  executor,
+  collectedToolEvents,
+  autopilot,
+  autopilotWarnings,
+  onLifecycleEvent,
+  onToolStart,
+  onToolEvent
+}: {
+  provider: AgentProvider;
+  model?: string;
+  repoFullName: string;
+  prompt: string;
+  rootPath: string;
+  result: AgentRunResponse;
+  changedFiles: string[];
+  executor: ToolExecutor;
+  collectedToolEvents: AgentToolEvent[];
+  autopilot: boolean;
+  autopilotWarnings: string[];
+  onLifecycleEvent?: (event: AgentLifecycleEvent) => void | Promise<void>;
+  onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
+  onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
+}): Promise<{ result: AgentRunResponse; changedFiles: string[] }> {
+  let result = initialResult;
+  let changedFiles = initialChangedFiles;
+  const maxRepairAttempts = githubReviewRepairAttempts(autopilot);
+
+  for (let attempt = 0; attempt <= maxRepairAttempts; attempt += 1) {
+    await emitLifecycleEvent(
+      onLifecycleEvent,
+      "validating",
+      attempt === 0
+        ? "Running automatic validation before reviewer gate."
+        : `Running automatic validation after reviewer repair ${attempt}/${maxRepairAttempts}.`
+    );
+    const automaticValidation = await runAutomaticValidation(rootPath, changedFiles);
+    result = withValidationResult(result, collectedToolEvents, automaticValidation);
+
+    await emitLifecycleEvent(
+      onLifecycleEvent,
+      "reviewing",
+      attempt === 0
+        ? "Reviewing the proposed changes against the request and validation output."
+        : `Reviewing repaired changes, attempt ${attempt}/${maxRepairAttempts}.`
+    );
+    const review = await reviewGitHubRun({
+      provider,
+      model,
+      repoFullName,
+      prompt,
+      rootPath,
+      result,
+      changedFiles
+    });
+    result = withReviewResult({ ...result, toolEvents: collectedToolEvents }, review);
+
+    const needsRepair = Boolean(pauseReasonForResult(result));
+    await emitLifecycleEvent(
+      onLifecycleEvent,
+      "reviewing",
+      needsRepair
+        ? `Reviewer gate requested more work${attempt < maxRepairAttempts ? "; preparing a repair pass." : "; repair budget is exhausted."}`
+        : "Reviewer gate approved the proposed changes.",
+      needsRepair ? "paused" : "completed"
+    );
+
+    if (!needsRepair || attempt >= maxRepairAttempts) {
+      return { result: withAutopilotMetadata(result, autopilot, autopilotWarnings), changedFiles };
+    }
+
+    const diff = await safeReviewDiff(rootPath, changedFiles);
+    try {
+      await emitLifecycleEvent(onLifecycleEvent, "editing", `Running reviewer repair ${attempt + 1}/${maxRepairAttempts}.`);
+      const repair = await runAgentTask({
+        provider,
+        model,
+        prompt: buildReviewerRepairPrompt({
+          repoFullName,
+          userPrompt: prompt,
+          review,
+          validation: result.validation || [],
+          changedFiles,
+          diff,
+          attempt: attempt + 1,
+          maxAttempts: maxRepairAttempts
+        }),
+        executor,
+        maxToolRounds: githubReviewRepairToolRounds(),
+        onToolStart,
+        onToolEvent: async (event) => {
+          collectedToolEvents.push(event);
+          await onToolEvent?.(event);
+        }
+      });
+      result = mergeRepairResult(result, repair, collectedToolEvents, attempt + 1);
+    } catch (error) {
+      result = mergeRepairResult(
+        result,
+        recoverAgentRunResponse(provider, model, collectedToolEvents, error),
+        collectedToolEvents,
+        attempt + 1
+      );
+    }
+
+    changedFiles = await committableChangedFileNames(rootPath, await changedFileNames(rootPath));
+    if (changedFiles.length === 0) return { result: withAutopilotMetadata(result, autopilot, autopilotWarnings), changedFiles };
+  }
+
+  return { result: withAutopilotMetadata(result, autopilot, autopilotWarnings), changedFiles };
+}
+
+function withValidationResult(
+  result: AgentRunResponse,
+  toolEvents: AgentToolEvent[],
+  automaticValidation: ValidationCheck[]
+): AgentRunResponse {
+  const validation = latestValidationChecks([
+    ...validationChecksFromToolEvents(toolEvents, false),
+    ...automaticValidation
+  ]);
+  const hasFailedValidation = validation.some((check) => check.status === "failed");
+  const stopReason = hasFailedValidation
+    ? "validation_failed"
+    : result.stopReason === "validation_failed" || result.stopReason === "review_failed"
+      ? undefined
+      : result.stopReason;
+  return {
+    ...result,
+    toolEvents,
+    validation: validation.length > 0 ? validation : validationChecksFromToolEvents(toolEvents, true),
+    stopReason
+  };
+}
+
+function latestValidationChecks(checks: ValidationCheck[]): ValidationCheck[] {
+  const latest = new Map<string, ValidationCheck>();
+  for (const check of checks) {
+    latest.set(normalizeValidationCommandKey(check.command), check);
+  }
+  return [...latest.values()];
+}
+
+function normalizeValidationCommandKey(command: string): string {
+  return command.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+async function runAutomaticValidation(rootPath: string, changedFiles: string[]): Promise<ValidationCheck[]> {
+  return [
+    await runStaticAwarenessCheck(rootPath, changedFiles),
+    ...await runPackageValidationChecks(rootPath)
+  ];
+}
+
+async function runStaticAwarenessCheck(rootPath: string, changedFiles: string[]): Promise<ValidationCheck> {
+  const sourceFiles = changedFiles.filter((file) => /\.(tsx|ts|jsx|js)$/.test(file));
+  if (sourceFiles.length === 0) {
+    return {
+      command: "static-awareness",
+      status: "not_run",
+      summary: "No changed JavaScript or TypeScript source files required static awareness checks."
+    };
+  }
+
+  const findings: string[] = [];
+  for (const file of sourceFiles) {
+    const absolutePath = await resolveSandboxPath(rootPath, file);
+    if (!existsSync(absolutePath)) continue;
+    const info = await stat(absolutePath);
+    if (!info.isFile() || info.size > 300_000) continue;
+    const content = await readFile(absolutePath, "utf8");
+    findings.push(...reactHookImportFindings(file, content));
+  }
+
+  return {
+    command: "static-awareness",
+    status: findings.length > 0 ? "failed" : "passed",
+    summary: findings.length > 0
+      ? `Found ${findings.length} simple import/reference issue(s).`
+      : `Scanned ${sourceFiles.length} changed source file(s) for simple import/reference issues.`,
+    output: findings.length > 0 ? findings.join("\n") : undefined
+  };
+}
+
+function reactHookImportFindings(file: string, content: string): string[] {
+  const hooks = [
+    "useActionState",
+    "useCallback",
+    "useContext",
+    "useDeferredValue",
+    "useEffect",
+    "useId",
+    "useImperativeHandle",
+    "useInsertionEffect",
+    "useLayoutEffect",
+    "useMemo",
+    "useOptimistic",
+    "useReducer",
+    "useRef",
+    "useState",
+    "useSyncExternalStore",
+    "useTransition"
+  ];
+  const importedReactNames = reactNamedImports(content);
+  const findings: string[] = [];
+
+  for (const hook of hooks) {
+    if (!bareFunctionCallExists(content, hook)) continue;
+    if (importedReactNames.has(hook)) continue;
+    if (localDeclarationExists(content, hook)) continue;
+    findings.push(`${file}: ${hook}() is used as a bare React hook but is not imported from react.`);
+  }
+
+  return findings;
+}
+
+function reactNamedImports(content: string): Set<string> {
+  const names = new Set<string>();
+  const imports = content.matchAll(/import\s+(?:type\s+)?([^;]*?)\s+from\s+["']react["']/g);
+  for (const match of imports) {
+    const clause = match[1] || "";
+    const named = clause.match(/\{([^}]+)\}/);
+    if (!named) continue;
+    const namedImports = named[1] || "";
+    for (const part of namedImports.split(",")) {
+      const localName = part.trim().split(/\s+as\s+/i).pop()?.trim();
+      if (localName) names.add(localName);
+    }
+  }
+  return names;
+}
+
+function bareFunctionCallExists(content: string, name: string): boolean {
+  return new RegExp(`(^|[^\\w$.])${name}\\s*\\(`).test(content);
+}
+
+function localDeclarationExists(content: string, name: string): boolean {
+  return new RegExp(`\\b(function|const|let|var)\\s+${name}\\b`).test(content);
+}
+
+async function runPackageValidationChecks(rootPath: string): Promise<ValidationCheck[]> {
+  const packageJsonPath = path.join(rootPath, "package.json");
+  if (!existsSync(packageJsonPath)) {
+    return [{
+      command: "package validation",
+      status: "not_run",
+      summary: "No package.json was found at the repository root."
+    }];
+  }
+
+  const scripts = await packageScripts(packageJsonPath);
+  const commands: Array<{ command: string; program: string; args: string[] }> = [];
+  const packageRunner = packageManagerRunner(rootPath);
+  if (scripts.typecheck) commands.push({ command: `${packageRunner} run typecheck`, program: packageRunner, args: ["run", "typecheck"] });
+  if (!scripts.typecheck && scripts.check) commands.push({ command: `${packageRunner} run check`, program: packageRunner, args: ["run", "check"] });
+  if (scripts.build) commands.push({ command: `${packageRunner} run build`, program: packageRunner, args: ["run", "build"] });
+
+  if (commands.length === 0) {
+    return [{
+      command: "package validation",
+      status: "not_run",
+      summary: "package.json does not define typecheck, check, or build scripts."
+    }];
+  }
+
+  if (!existsSync(path.join(rootPath, "node_modules"))) {
+    return [{
+      command: "package validation",
+      status: "not_run",
+      summary: "Skipped package validation because dependencies are not installed in the disposable sandbox."
+    }];
+  }
+
+  const checks: ValidationCheck[] = [];
+  for (const { command, program, args } of commands.slice(0, 2)) {
+    const startedAt = Date.now();
+    const result = await runProcess(program, args, rootPath, 120_000);
+    const output = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n\n");
+    checks.push({
+      command,
+      status: result.exitCode === 0 ? "passed" : "failed",
+      summary: `Automatic validation exited with code ${result.exitCode} in ${formatDurationMs(Date.now() - startedAt)}.`,
+      output: output ? truncateMiddle(output, 8_000) : undefined
+    });
+    if (result.exitCode !== 0) break;
+  }
+  return checks;
+}
+
+async function packageScripts(packageJsonPath: string): Promise<Record<string, string>> {
+  try {
+    const parsed = JSON.parse(await readFile(packageJsonPath, "utf8")) as { scripts?: unknown };
+    return asRecord(parsed.scripts) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+function packageManagerRunner(rootPath: string): string {
+  if (existsSync(path.join(rootPath, "pnpm-lock.yaml"))) return "pnpm";
+  if (existsSync(path.join(rootPath, "yarn.lock"))) return "yarn";
+  if (existsSync(path.join(rootPath, "bun.lockb")) || existsSync(path.join(rootPath, "bun.lock"))) return "bun";
+  return "npm";
+}
+
+function formatDurationMs(durationMs: number): string {
+  return `${(durationMs / 1000).toFixed(1)}s`;
+}
+
 async function reviewGitHubRun({
   provider,
   model,
@@ -810,6 +1188,14 @@ async function reviewDiff(rootPath: string, changedFiles: string[]): Promise<str
   return truncateMiddle(sections.filter(Boolean).join("\n\n") || "(no diff)", 70_000);
 }
 
+async function safeReviewDiff(rootPath: string, changedFiles: string[]): Promise<string> {
+  try {
+    return await reviewDiff(rootPath, changedFiles);
+  } catch (error) {
+    return `Diff collection failed: ${errorMessage(error)}`;
+  }
+}
+
 function buildReviewPrompt({
   repoFullName,
   userPrompt,
@@ -856,6 +1242,64 @@ function buildReviewPrompt({
     "",
     "Diff:",
     diff
+  ].join("\n");
+}
+
+function buildReviewerRepairPrompt({
+  repoFullName,
+  userPrompt,
+  review,
+  validation,
+  changedFiles,
+  diff,
+  attempt,
+  maxAttempts
+}: {
+  repoFullName: string;
+  userPrompt: string;
+  review: AgentReviewResult;
+  validation: ValidationCheck[];
+  changedFiles: string[];
+  diff: string;
+  attempt: number;
+  maxAttempts: number;
+}): string {
+  return [
+    "Continue the existing GitHub repository task by repairing only the issues identified by the reviewer and validation gate.",
+    "Do not restart from scratch. Preserve useful existing edits and make the smallest cohesive fix that satisfies the original request.",
+    "Before editing, read the exact files you need. After editing, inspect the diff and run the relevant check when possible.",
+    "Pay special attention to simple awareness bugs: imports, removed hooks, missing symbols, renamed identifiers, props, exports, and files that still reference code you changed.",
+    "",
+    `Repository: ${repoFullName}`,
+    `Repair attempt: ${attempt}/${maxAttempts}`,
+    "",
+    "Original user request:",
+    userPrompt,
+    "",
+    "Reviewer status:",
+    review.status,
+    "",
+    "Reviewer summary:",
+    review.summary,
+    "",
+    "Reviewer findings:",
+    review.findings.length > 0 ? review.findings.map((finding) => `- ${finding}`).join("\n") : "- none",
+    "",
+    "Acceptance criteria:",
+    review.acceptanceCriteria.map((criterion) => (
+      `- ${criterion.id} [${criterion.status}]: ${criterion.description}${criterion.evidence ? ` Evidence: ${criterion.evidence}` : ""}`
+    )).join("\n"),
+    "",
+    "Validation feedback:",
+    validation.length > 0 ? JSON.stringify(validation, null, 2) : "[]",
+    "",
+    "Changed files:",
+    changedFiles.map((file) => `- ${file}`).join("\n"),
+    "",
+    "Current diff:",
+    diff,
+    "",
+    "When finished, summarize the repair and validation. If you cannot fix a finding, explain exactly what blocks it."
   ].join("\n");
 }
 
@@ -997,13 +1441,40 @@ function heuristicReviewResult(
 function withReviewResult(result: AgentRunResponse, review: AgentReviewResult): AgentRunResponse {
   const acceptanceCriteria = review.acceptanceCriteria;
   const validation = review.validation.length > 0 ? review.validation : result.validation;
+  const needsRepair = reviewRequiresPause(review);
+  const stopReason = needsRepair
+    ? "review_failed"
+    : result.stopReason === "review_failed" || result.stopReason === "validation_failed"
+      ? undefined
+      : result.stopReason;
   return {
     ...result,
-    lifecycleStatus: reviewRequiresPause(review) ? "needs_review" : "completed",
+    lifecycleStatus: needsRepair ? "needs_review" : "completed",
     acceptanceCriteria,
     validation,
     review,
-    stopReason: reviewRequiresPause(review) ? "review_failed" : result.stopReason
+    stopReason
+  };
+}
+
+function mergeRepairResult(
+  previous: AgentRunResponse,
+  repair: AgentRunResponse,
+  collectedToolEvents: AgentToolEvent[],
+  attempt: number
+): AgentRunResponse {
+  return {
+    ...repair,
+    toolEvents: collectedToolEvents,
+    text: [
+      previous.text,
+      "",
+      `Reviewer repair attempt ${attempt}:`,
+      repair.text
+    ].join("\n"),
+    acceptanceCriteria: previous.acceptanceCriteria,
+    validation: previous.validation,
+    review: previous.review
   };
 }
 
@@ -1408,6 +1879,7 @@ function buildRepositoryPrompt(
     "7. Inspect git_diff after editing and compare the diff to every acceptance criterion.",
     "8. Run obvious checks such as typecheck, lint, build, or focused tests. Treat passing typecheck as necessary but not sufficient.",
     "9. If validation fails or an acceptance criterion is unmet, use the feedback to continue fixing before finalizing.",
+    "10. Before finishing, re-check import/reference integrity in every changed source file. If you remove or rename imports, hooks, components, props, exports, or helper functions, update every remaining reference.",
     "",
     "Do not stop with advice or a written plan when the user asks you to make changes.",
     "For broad UI/design prompts, improve structure, density, hierarchy, spacing, states, and workflow fit as needed; do not treat the task as only changing colors.",
@@ -1603,8 +2075,8 @@ function immediatePauseReasonForResult(result: AgentRunResponse): AgentRunRespon
 
 function pauseReasonForResult(result: AgentRunResponse): AgentRunResponse["stopReason"] | undefined {
   if (result.stopReason === "max_tool_rounds" || result.stopReason === "provider_error") return result.stopReason;
-  if (hasFailedValidation(result.toolEvents)) return "validation_failed";
   if (result.validation?.some((check) => check.status === "failed")) return "validation_failed";
+  if (!result.validation?.length && hasFailedValidation(result.toolEvents)) return "validation_failed";
   if (result.stopReason === "review_failed") return result.stopReason;
   if (reviewRequiresPause(result.review)) return "review_failed";
   return undefined;
@@ -1748,6 +2220,22 @@ function assertSafePauseId(pauseId: string): void {
 function githubWriteMaxToolRounds(): number {
   const configured = Number(process.env.GITHUB_WRITE_MAX_TOOL_ROUNDS);
   return Number.isFinite(configured) ? Math.max(4, Math.min(80, Math.floor(configured))) : 18;
+}
+
+function githubReviewRepairAttempts(autopilot: boolean): number {
+  const configured = Number(
+    autopilot
+      ? process.env.GITHUB_AUTOPILOT_REVIEW_REPAIR_ATTEMPTS || process.env.GITHUB_REVIEW_REPAIR_ATTEMPTS
+      : process.env.GITHUB_REVIEW_REPAIR_ATTEMPTS
+  );
+  if (Number.isFinite(configured)) return Math.max(0, Math.min(8, Math.floor(configured)));
+  return autopilot ? 4 : 2;
+}
+
+function githubReviewRepairToolRounds(): number {
+  const configured = Number(process.env.GITHUB_REVIEW_REPAIR_TOOL_ROUNDS);
+  if (Number.isFinite(configured)) return Math.max(4, Math.min(40, Math.floor(configured)));
+  return Math.max(6, Math.min(12, githubWriteMaxToolRounds()));
 }
 
 function pauseReasonLabel(reason: NonNullable<AgentRunResponse["stopReason"]>): string {
