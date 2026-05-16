@@ -153,6 +153,13 @@ Paused runs keep their sandbox and diff, then the web UI offers **Continue**,
 **Open Draft PR**, **Stop Without PR**, and **Discard Sandbox**. Set
 `GITHUB_WRITE_MAX_TOOL_ROUNDS` to change the checkpoint size.
 
+The GitHub panel also has an **Autopilot** checkbox. Autopilot is intentionally
+aggressive: it ignores repository-agent pause checkpoints, allows high-risk
+commands inside the disposable GitHub sandbox, and opens a PR when non-empty
+changes exist even if validation or the reviewer gate raises warnings. It still
+does not approve, merge, or push directly to the repository default branch.
+Autopilot warnings are written into the PR body and returned in the run result.
+
 Coding prompts use a structured delivery loop: derive an implementation plan and
 acceptance criteria, inspect the owning files, implement against those criteria,
 inspect the diff, run relevant validation, and summarize which criteria were

@@ -46,6 +46,8 @@ type GitHubTaskResult = AgentRunResponse & {
   pauseReason?: AgentRunResponse["stopReason"];
   resumeAvailable?: boolean;
   diffSummary?: string;
+  autopilot?: boolean;
+  autopilotWarnings?: string[];
 };
 
 type GitHubPullRequest = {
@@ -104,6 +106,7 @@ export default function Home() {
   const [githubRepos, setGithubRepos] = useState<GitHubRepository[]>([]);
   const [githubRepoFullName, setGithubRepoFullName] = useState("");
   const [githubPrompt, setGithubPrompt] = useState("Inspect this repository and summarize what it does.");
+  const [githubAutopilot, setGithubAutopilot] = useState(false);
   const [githubResult, setGithubResult] = useState<GitHubTaskResult | null>(null);
   const [githubToolEvents, setGithubToolEvents] = useState<LiveToolEvent[]>([]);
   const [githubRunTimer, setGithubRunTimer] = useState<RunTimer | null>(null);
@@ -276,7 +279,8 @@ export default function Home() {
           prompt: githubPrompt,
           provider,
           model: model || undefined,
-          mode: "auto"
+          mode: "auto",
+          autopilot: githubAutopilot
         })
       });
       const data = await readAgentStream<GitHubTaskResult>(response, {
@@ -614,6 +618,8 @@ export default function Home() {
                 setGithubRepoFullName={selectGithubRepo}
                 githubPrompt={githubPrompt}
                 setGithubPrompt={setGithubPrompt}
+                githubAutopilot={githubAutopilot}
+                setGithubAutopilot={setGithubAutopilot}
                 loadGithubRepositories={loadGithubRepositories}
                 loadGithubPullRequests={loadGithubPullRequests}
                 updateGithubPullRequest={updateGithubPullRequest}
@@ -733,6 +739,8 @@ function GithubAgentPanel({
   setGithubRepoFullName,
   githubPrompt,
   setGithubPrompt,
+  githubAutopilot,
+  setGithubAutopilot,
   loadGithubRepositories,
   loadGithubPullRequests,
   updateGithubPullRequest,
@@ -752,6 +760,8 @@ function GithubAgentPanel({
   setGithubRepoFullName: (value: string) => void;
   githubPrompt: string;
   setGithubPrompt: (value: string) => void;
+  githubAutopilot: boolean;
+  setGithubAutopilot: (value: boolean) => void;
   loadGithubRepositories: () => void;
   loadGithubPullRequests: () => void;
   updateGithubPullRequest: (number: number, action: "approve" | "close") => void;
@@ -791,6 +801,17 @@ function GithubAgentPanel({
         </select>
       </label>
       <textarea rows={5} value={githubPrompt} onChange={(event) => setGithubPrompt(event.target.value)} />
+      <label className={`autopilot-toggle ${githubAutopilot ? "active" : ""}`}>
+        <input
+          type="checkbox"
+          checked={githubAutopilot}
+          onChange={(event) => setGithubAutopilot(event.target.checked)}
+        />
+        <span>
+          <strong>Autopilot</strong>
+          <small>No pause checkpoints. High-risk sandbox commands are allowed.</small>
+        </span>
+      </label>
       <button className="primary" disabled={busy === "github-agent" || !githubRepoFullName || !githubPrompt.trim()} onClick={runGithubAgent}>
         Run Agent
       </button>
@@ -842,6 +863,12 @@ function GithubAgentPanel({
           "Install the GitHub App, load repositories, then select one and prompt the agent."
         )}
       </div>
+      {githubResult?.autopilot ? (
+        <div className="autopilot-note">
+          Autopilot was enabled for this run.
+          {githubResult.autopilotWarnings?.length ? ` ${githubResult.autopilotWarnings.join(" ")}` : ""}
+        </div>
+      ) : null}
       <RunQualityPanel result={githubResult} />
       <pre className="chat-output">{githubResult?.text || "No GitHub agent result yet."}</pre>
 
@@ -1202,7 +1229,7 @@ function describeRunFinish(startedAt: number, finishedAt: number, toolEvents: Ag
 function describeGitHubRunFinish(startedAt: number, finishedAt: number, result: GitHubTaskResult): string {
   const base = describeRunFinish(startedAt, finishedAt, result.toolEvents);
   if (result.status === "paused") return `${base} Paused for confirmation: ${pauseReasonText(result.pauseReason)}`;
-  if (result.pullRequestUrl) return `${base} Opened pull request #${result.pullRequestNumber}.`;
+  if (result.pullRequestUrl) return `${base} Opened pull request #${result.pullRequestNumber}${result.autopilot ? " in autopilot mode" : ""}.`;
   if (result.mode === "write") return `${base} Write-mode run completed without opening a pull request.`;
   return `${base} Read-only repository response completed.`;
 }

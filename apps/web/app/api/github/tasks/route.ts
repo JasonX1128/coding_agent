@@ -11,7 +11,8 @@ const bodySchema = z.object({
   prompt: z.string().min(1),
   provider: z.enum(["mock", "openai", "anthropic", "google", "groq"]).default("mock"),
   model: z.string().optional(),
-  mode: z.enum(["auto", "read", "write"]).optional().default("auto")
+  mode: z.enum(["auto", "read", "write"]).optional().default("auto"),
+  autopilot: z.boolean().optional().default(false)
 });
 
 export async function POST(request: Request) {
@@ -23,7 +24,8 @@ export async function POST(request: Request) {
       prompt: body.prompt,
       provider: body.provider as AgentProvider,
       model: body.model,
-      mode: body.mode
+      mode: body.mode,
+      autopilot: body.autopilot
     });
     return NextResponse.json(result);
   } catch (error) {

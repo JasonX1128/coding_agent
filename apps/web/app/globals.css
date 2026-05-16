@@ -497,6 +497,45 @@ pre {
   max-height: 180px;
 }
 
+.autopilot-toggle {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 10px;
+}
+
+.autopilot-toggle.active {
+  border-color: #f59e0b;
+  background: #fffbeb;
+}
+
+.autopilot-toggle input {
+  width: auto;
+  margin-top: 3px;
+}
+
+.autopilot-toggle span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.autopilot-toggle small,
+.autopilot-note {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.autopilot-note {
+  border-left: 3px solid #f59e0b;
+  background: #fffbeb;
+  padding: 8px 10px;
+}
+
 .quality-panel {
   display: flex;
   flex-direction: column;

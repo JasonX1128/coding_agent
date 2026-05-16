@@ -41,6 +41,7 @@ export type GitHubRepositoryTaskRequest = {
   provider: AgentProvider;
   model?: string;
   mode?: GitHubTaskMode;
+  autopilot?: boolean;
   onLifecycleEvent?: (event: AgentLifecycleEvent) => void | Promise<void>;
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
@@ -58,6 +59,8 @@ export type GitHubRepositoryTaskResult = AgentRunResponse & {
   pauseReason?: AgentRunResponse["stopReason"];
   resumeAvailable?: boolean;
   diffSummary?: string;
+  autopilot?: boolean;
+  autopilotWarnings?: string[];
 };
 
 export type PausedGitHubRunAction = "open_draft_pr" | "stop" | "discard";
@@ -83,6 +86,8 @@ type PausedGitHubRunRecord = {
   acceptanceCriteria?: AcceptanceCriterion[];
   validation?: ValidationCheck[];
   review?: AgentReviewResult;
+  autopilot?: boolean;
+  autopilotWarnings?: string[];
 };
 
 const skippedDirectories = new Set([".git", "node_modules", ".next", "dist", "coverage", ".turbo"]);
@@ -94,6 +99,8 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
   const installationToken = await createInstallationToken(repo.installationId);
   const sandboxRoot = await createSandboxRoot();
   const cloneUrl = tokenizedCloneUrl(repo.fullName, installationToken.token);
+  const autopilot = request.autopilot === true;
+  const autopilotWarnings: string[] = [];
   await emitLifecycleEvent(request.onLifecycleEvent, "classifying", "Classifying the repository prompt into read or write mode.");
   const mode = await resolveGitHubTaskMode({
     prompt: request.prompt,
@@ -120,7 +127,9 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
   await emitLifecycleEvent(request.onLifecycleEvent, "cloning", `Sandbox ready for ${repo.fullName}.`);
 
   const rootPath = await realpath(sandboxRoot);
-  const executor = mode === "write" ? createWritableSandboxExecutor(rootPath) : createReadOnlySandboxExecutor(rootPath);
+  const executor = mode === "write"
+    ? createWritableSandboxExecutor(rootPath, { allowHighRiskCommands: autopilot })
+    : createReadOnlySandboxExecutor(rootPath);
   const collectedToolEvents: AgentToolEvent[] = [];
   let result: AgentRunResponse;
   try {
@@ -132,7 +141,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     result = await runAgentTask({
       provider: request.provider,
       model: request.model,
-      prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt),
+      prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt, autopilot),
       executor,
       maxToolRounds: mode === "write" ? githubWriteMaxToolRounds() : 12,
       onToolStart: request.onToolStart,
@@ -147,7 +156,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     await emitLifecycleEvent(request.onLifecycleEvent, "recovered", "Recovered from a provider error after partial progress.", "failed");
   }
 
-  result = enrichAgentRunResult(result, collectedToolEvents);
+  result = withAutopilotMetadata(enrichAgentRunResult(result, collectedToolEvents), autopilot, autopilotWarnings);
   const changedFiles = await changedFileNames(rootPath);
   const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
   const immediatePauseReason = mode === "write" ? immediatePauseReasonForResult(result) : undefined;
@@ -157,13 +166,15 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
       repository: repo.fullName,
       mode,
       changedFiles: [],
-      sandboxRoot
+      sandboxRoot,
+      autopilot,
+      autopilotWarnings
     };
   }
 
   if (!branchName) throw new Error("Write-mode GitHub task did not create a working branch.");
 
-  if (immediatePauseReason) {
+  if (immediatePauseReason && !autopilot) {
     await emitLifecycleEvent(request.onLifecycleEvent, "paused", `Paused before PR creation: ${pauseReasonLabel(immediatePauseReason)}.`, "paused");
     return pauseGitHubRun({
       installationId: repo.installationId,
@@ -180,6 +191,10 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
       changedFiles: committableFiles
     });
   }
+  if (immediatePauseReason && autopilot) {
+    autopilotWarnings.push(`Autopilot ignored checkpoint: ${pauseReasonLabel(immediatePauseReason)}.`);
+    result = withAutopilotMetadata(result, autopilot, autopilotWarnings);
+  }
 
   if (committableFiles.length === 0) {
     return {
@@ -189,6 +204,10 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
       branchName,
       changedFiles: committableFiles,
       sandboxRoot,
+      status: autopilot ? "completed" : result.status,
+      lifecycleStatus: autopilot ? "completed" : result.lifecycleStatus,
+      autopilot,
+      autopilotWarnings,
       text: `${result.text}\n\nNo non-empty file changes were produced, so no pull request was opened.`
     };
   }
@@ -212,7 +231,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
   );
 
   const gatedPauseReason = pauseReasonForResult(result);
-  if (gatedPauseReason) {
+  if (gatedPauseReason && !autopilot) {
     await emitLifecycleEvent(request.onLifecycleEvent, "needs_review", `Paused before PR creation: ${pauseReasonLabel(gatedPauseReason)}.`, "paused");
     return pauseGitHubRun({
       installationId: repo.installationId,
@@ -229,8 +248,16 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
       changedFiles: committableFiles
     });
   }
+  if (gatedPauseReason && autopilot) {
+    autopilotWarnings.push(`Autopilot ignored checkpoint: ${pauseReasonLabel(gatedPauseReason)}.`);
+    result = withAutopilotMetadata(result, autopilot, autopilotWarnings);
+  }
 
-  await emitLifecycleEvent(request.onLifecycleEvent, "opening_pr", "Opening a pull request for the reviewed changes.");
+  await emitLifecycleEvent(
+    request.onLifecycleEvent,
+    "opening_pr",
+    autopilot ? "Opening a pull request in autopilot mode despite any quality checkpoints." : "Opening a pull request for the reviewed changes."
+  );
   return finalizeGitHubRun({
     installationId: repo.installationId,
     repoFullName: repo.fullName,
@@ -242,7 +269,9 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     result,
     changedFiles: committableFiles,
     mode,
-    draft: false
+    draft: false,
+    autopilot,
+    autopilotWarnings
   });
 }
 
@@ -444,7 +473,9 @@ async function finalizeGitHubRun({
   result,
   changedFiles,
   mode,
-  draft
+  draft,
+  autopilot = false,
+  autopilotWarnings = []
 }: {
   installationId: number;
   repoFullName: string;
@@ -457,6 +488,8 @@ async function finalizeGitHubRun({
   changedFiles: string[];
   mode: ResolvedGitHubTaskMode;
   draft: boolean;
+  autopilot?: boolean;
+  autopilotWarnings?: string[];
 }): Promise<GitHubRepositoryTaskResult> {
   await runRequired("git", ["add", "-A", "--", ...changedFiles], rootPath, 20_000);
   await runRequired("git", ["commit", "-m", commitTitle(prompt)], rootPath, 60_000);
@@ -472,7 +505,7 @@ async function finalizeGitHubRun({
     installationId,
     repoFullName,
     title: prTitle(prompt),
-    body: prBody(prompt, result, changedFiles),
+    body: prBody(prompt, result, changedFiles, { autopilot, autopilotWarnings }),
     head: branchName,
     base: defaultBranch,
     draft
@@ -487,8 +520,10 @@ async function finalizeGitHubRun({
     pullRequestNumber: pullRequest.number,
     changedFiles,
     sandboxRoot: rootPath,
-    status: draft ? "completed" : result.status,
-    lifecycleStatus: "completed"
+    status: draft || autopilot ? "completed" : result.status,
+    lifecycleStatus: "completed",
+    autopilot,
+    autopilotWarnings
   };
 }
 
@@ -625,6 +660,18 @@ function enrichAgentRunResult(
     acceptanceCriteria: result.acceptanceCriteria || record?.acceptanceCriteria,
     validation: validation.length > 0 ? validation : result.validation || record?.validation,
     review: result.review || record?.review
+  };
+}
+
+function withAutopilotMetadata(
+  result: AgentRunResponse,
+  autopilot: boolean,
+  autopilotWarnings: string[]
+): AgentRunResponse & Pick<GitHubRepositoryTaskResult, "autopilot" | "autopilotWarnings"> {
+  return {
+    ...result,
+    autopilot,
+    autopilotWarnings
   };
 }
 
@@ -1000,7 +1047,10 @@ function createReadOnlySandboxExecutor(rootPath: string): ToolExecutor {
   };
 }
 
-function createWritableSandboxExecutor(rootPath: string): ToolExecutor {
+function createWritableSandboxExecutor(
+  rootPath: string,
+  options: { allowHighRiskCommands?: boolean } = {}
+): ToolExecutor {
   return async (name: DaemonToolName, args: Record<string, unknown>) => {
     try {
       if (name === "list_files") return listFilesTool(rootPath, args);
@@ -1011,7 +1061,7 @@ function createWritableSandboxExecutor(rootPath: string): ToolExecutor {
       if (name === "create_file") return createFileTool(rootPath, args);
       if (name === "replace_text") return replaceTextTool(rootPath, args);
       if (name === "apply_patch") return applyPatchTool(rootPath, args);
-      if (name === "run_command") return runCommandTool(rootPath, args);
+      if (name === "run_command") return runCommandTool(rootPath, args, options);
       return toolResult("failed", `Unsupported tool: ${name}`);
     } catch (error) {
       return toolResult("failed", error instanceof Error ? error.message : "Unknown sandbox tool error");
@@ -1176,17 +1226,22 @@ async function replaceTextTool(rootPath: string, args: Record<string, unknown>):
   });
 }
 
-async function runCommandTool(rootPath: string, args: Record<string, unknown>): Promise<ToolResult<CommandResult>> {
+async function runCommandTool(
+  rootPath: string,
+  args: Record<string, unknown>,
+  options: { allowHighRiskCommands?: boolean } = {}
+): Promise<ToolResult<CommandResult>> {
   const command = typeof args.command === "string" ? args.command : "";
   if (!command) return toolResult<CommandResult>("failed", "Missing command.");
   const risk = scoreCommandRisk(command);
-  if (risk === "high") {
+  if (risk === "high" && !options.allowHighRiskCommands) {
     return toolResult<CommandResult>("requires_approval", "High-risk commands are blocked in GitHub App sandboxes.", undefined, risk);
   }
 
   const startedAt = Date.now();
   const result = await runProcess(command, [], rootPath, 60_000, undefined, true);
-  return toolResult(result.exitCode === 0 ? "completed" : "failed", `Command exited with code ${result.exitCode}.`, {
+  const summaryPrefix = risk === "high" && options.allowHighRiskCommands ? "Autopilot allowed high-risk command. " : "";
+  return toolResult(result.exitCode === 0 ? "completed" : "failed", `${summaryPrefix}Command exited with code ${result.exitCode}.`, {
     command,
     exitCode: result.exitCode,
     stdout: result.stdout,
@@ -1333,12 +1388,15 @@ function buildRepositoryPrompt(
   defaultBranch: string,
   branchName: string | undefined,
   mode: ResolvedGitHubTaskMode,
-  userPrompt: string
+  userPrompt: string,
+  autopilot = false
 ): string {
   const writeInstructions = [
     `Working branch: ${branchName}`,
     "",
     "The user's prompt appears to request code or file changes, so write tools are enabled.",
+    autopilot ? "Autopilot mode is enabled: do not stop for repository-agent checkpoints, and high-risk shell commands are allowed inside this disposable sandbox when they are genuinely needed." : "",
+    autopilot ? "Even in autopilot mode, do not approve, merge, or push directly to the base branch. The workflow will only create an agent branch and pull request." : "",
     "",
     "Enterprise delivery loop:",
     "1. Restate the user's product intent in concrete engineering terms.",
@@ -1704,7 +1762,12 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
-function prBody(prompt: string, result: AgentRunResponse, changedFiles: string[]): string {
+function prBody(
+  prompt: string,
+  result: AgentRunResponse,
+  changedFiles: string[],
+  options: { autopilot?: boolean; autopilotWarnings?: string[] } = {}
+): string {
   return [
     "## Request",
     "",
@@ -1736,6 +1799,13 @@ function prBody(prompt: string, result: AgentRunResponse, changedFiles: string[]
     result.review ? `Summary: ${result.review.summary}` : "",
     ...(result.review?.findings.length
       ? ["", ...result.review.findings.map((finding) => `- ${finding}`)]
+      : []),
+    "",
+    "## Autopilot",
+    "",
+    options.autopilot ? "Enabled: the run ignored repository-agent pause checkpoints and allowed high-risk sandbox commands." : "Disabled",
+    ...(options.autopilotWarnings?.length
+      ? ["", ...options.autopilotWarnings.map((warning) => `- ${warning}`)]
       : []),
     "",
     "## Run Status",
