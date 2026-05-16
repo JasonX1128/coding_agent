@@ -1,6 +1,10 @@
 import { runAgentTask, type ToolExecutor } from "@coding-agent/agent-core";
 import type {
+  AcceptanceCriterion,
+  AgentLifecycleEvent,
+  AgentLifecycleStatus,
   AgentProvider,
+  AgentReviewResult,
   AgentToolEvent,
   AgentToolStartEvent,
   AgentRunResponse,
@@ -13,6 +17,7 @@ import type {
   ReadFileResult,
   ReplaceTextResult,
   SearchResult,
+  ValidationCheck,
   ToolResult
 } from "@coding-agent/shared";
 import { existsSync } from "node:fs";
@@ -36,6 +41,7 @@ export type GitHubRepositoryTaskRequest = {
   provider: AgentProvider;
   model?: string;
   mode?: GitHubTaskMode;
+  onLifecycleEvent?: (event: AgentLifecycleEvent) => void | Promise<void>;
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
 };
@@ -74,24 +80,31 @@ type PausedGitHubRunRecord = {
   resultText: string;
   changedFiles: string[];
   diffSummary: string;
+  acceptanceCriteria?: AcceptanceCriterion[];
+  validation?: ValidationCheck[];
+  review?: AgentReviewResult;
 };
 
 const skippedDirectories = new Set([".git", "node_modules", ".next", "dist", "coverage", ".turbo"]);
 const maxOutputBytes = 200_000;
+const validationCommandPattern = /\b(typecheck|lint|test|build|check)\b/i;
 
 export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskRequest): Promise<GitHubRepositoryTaskResult> {
   const repo = await findInstalledRepository(request.repoFullName, request.installationId);
   const installationToken = await createInstallationToken(repo.installationId);
   const sandboxRoot = await createSandboxRoot();
   const cloneUrl = tokenizedCloneUrl(repo.fullName, installationToken.token);
+  await emitLifecycleEvent(request.onLifecycleEvent, "classifying", "Classifying the repository prompt into read or write mode.");
   const mode = await resolveGitHubTaskMode({
     prompt: request.prompt,
     requestedMode: request.mode || "auto",
     provider: request.provider,
     model: request.model
   });
+  await emitLifecycleEvent(request.onLifecycleEvent, "classifying", `Prompt classified as ${mode} mode.`);
   const branchName = mode === "write" ? createAgentBranchName(request.prompt) : undefined;
 
+  await emitLifecycleEvent(request.onLifecycleEvent, "cloning", `Cloning ${repo.fullName} into a disposable sandbox.`);
   await runRequired("git", ["clone", "--depth", "1", cloneUrl, sandboxRoot], process.cwd(), 120_000, installationToken.token);
   await runRequired("git", ["remote", "set-url", "origin", `https://github.com/${repo.fullName}.git`], sandboxRoot, 20_000);
   if (mode === "write" && branchName) {
@@ -104,12 +117,18 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
       20_000
     );
   }
+  await emitLifecycleEvent(request.onLifecycleEvent, "cloning", `Sandbox ready for ${repo.fullName}.`);
 
   const rootPath = await realpath(sandboxRoot);
   const executor = mode === "write" ? createWritableSandboxExecutor(rootPath) : createReadOnlySandboxExecutor(rootPath);
   const collectedToolEvents: AgentToolEvent[] = [];
   let result: AgentRunResponse;
   try {
+    await emitLifecycleEvent(
+      request.onLifecycleEvent,
+      mode === "write" ? "editing" : "planning",
+      mode === "write" ? "Running the coding agent with repository write tools." : "Running the repository agent with read-only tools."
+    );
     result = await runAgentTask({
       provider: request.provider,
       model: request.model,
@@ -122,13 +141,16 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
         await request.onToolEvent?.(event);
       }
     });
+    await emitLifecycleEvent(request.onLifecycleEvent, mode === "write" ? "editing" : "planning", "Agent tool loop completed.");
   } catch (error) {
     result = recoverAgentRunResponse(request.provider, request.model, collectedToolEvents, error);
+    await emitLifecycleEvent(request.onLifecycleEvent, "recovered", "Recovered from a provider error after partial progress.", "failed");
   }
 
+  result = enrichAgentRunResult(result, collectedToolEvents);
   const changedFiles = await changedFileNames(rootPath);
   const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
-  const pauseReason = mode === "write" ? pauseReasonForResult(result) : undefined;
+  const immediatePauseReason = mode === "write" ? immediatePauseReasonForResult(result) : undefined;
   if (mode === "read") {
     return {
       ...result,
@@ -141,7 +163,8 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
 
   if (!branchName) throw new Error("Write-mode GitHub task did not create a working branch.");
 
-  if (pauseReason) {
+  if (immediatePauseReason) {
+    await emitLifecycleEvent(request.onLifecycleEvent, "paused", `Paused before PR creation: ${pauseReasonLabel(immediatePauseReason)}.`, "paused");
     return pauseGitHubRun({
       installationId: repo.installationId,
       repoFullName: repo.fullName,
@@ -152,7 +175,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
       provider: request.provider,
       model: request.model,
       mode,
-      pauseReason,
+      pauseReason: immediatePauseReason,
       result,
       changedFiles: committableFiles
     });
@@ -170,6 +193,44 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     };
   }
 
+  await emitLifecycleEvent(request.onLifecycleEvent, "validating", "Summarizing validation feedback from the run.");
+  const review = await reviewGitHubRun({
+    provider: request.provider,
+    model: request.model,
+    repoFullName: repo.fullName,
+    prompt: request.prompt,
+    rootPath,
+    result,
+    changedFiles: committableFiles
+  });
+  result = withReviewResult(result, review);
+  await emitLifecycleEvent(
+    request.onLifecycleEvent,
+    "reviewing",
+    review.status === "approved" ? "Reviewer gate approved the proposed changes." : "Reviewer gate found issues that need a human or continuation.",
+    review.status === "approved" ? "completed" : "paused"
+  );
+
+  const gatedPauseReason = pauseReasonForResult(result);
+  if (gatedPauseReason) {
+    await emitLifecycleEvent(request.onLifecycleEvent, "needs_review", `Paused before PR creation: ${pauseReasonLabel(gatedPauseReason)}.`, "paused");
+    return pauseGitHubRun({
+      installationId: repo.installationId,
+      repoFullName: repo.fullName,
+      defaultBranch: repo.defaultBranch,
+      branchName,
+      sandboxRoot: rootPath,
+      prompt: request.prompt,
+      provider: request.provider,
+      model: request.model,
+      mode,
+      pauseReason: gatedPauseReason,
+      result,
+      changedFiles: committableFiles
+    });
+  }
+
+  await emitLifecycleEvent(request.onLifecycleEvent, "opening_pr", "Opening a pull request for the reviewed changes.");
   return finalizeGitHubRun({
     installationId: repo.installationId,
     repoFullName: repo.fullName,
@@ -188,11 +249,13 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
 export async function resumeGitHubRepositoryTask({
   pauseId,
   continuation,
+  onLifecycleEvent,
   onToolStart,
   onToolEvent
 }: {
   pauseId: string;
   continuation?: string;
+  onLifecycleEvent?: (event: AgentLifecycleEvent) => void | Promise<void>;
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
 }): Promise<GitHubRepositoryTaskResult> {
@@ -204,6 +267,7 @@ export async function resumeGitHubRepositoryTask({
   let result: AgentRunResponse;
 
   try {
+    await emitLifecycleEvent(onLifecycleEvent, "editing", `Continuing paused repository run ${pauseId}.`);
     result = await runAgentTask({
       provider: record.provider,
       model: record.model,
@@ -216,10 +280,13 @@ export async function resumeGitHubRepositoryTask({
         await onToolEvent?.(event);
       }
     });
+    await emitLifecycleEvent(onLifecycleEvent, "editing", "Continuation tool loop completed.");
   } catch (error) {
     result = recoverAgentRunResponse(record.provider, record.model, collectedToolEvents, error);
+    await emitLifecycleEvent(onLifecycleEvent, "recovered", "Recovered from a provider error during continuation.", "failed");
   }
 
+  result = enrichAgentRunResult(result, collectedToolEvents, record);
   const changedFiles = await changedFileNames(rootPath);
   const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
   if (committableFiles.length === 0) {
@@ -235,8 +302,9 @@ export async function resumeGitHubRepositoryTask({
     };
   }
 
-  const pauseReason = pauseReasonForResult(result);
-  if (pauseReason) {
+  const immediatePauseReason = immediatePauseReasonForResult(result);
+  if (immediatePauseReason) {
+    await emitLifecycleEvent(onLifecycleEvent, "paused", `Paused before PR creation: ${pauseReasonLabel(immediatePauseReason)}.`, "paused");
     return pauseGitHubRun({
       installationId: record.installationId,
       repoFullName: record.repoFullName,
@@ -247,13 +315,52 @@ export async function resumeGitHubRepositoryTask({
       provider: record.provider,
       model: record.model,
       mode: record.mode,
-      pauseReason,
+      pauseReason: immediatePauseReason,
       result: { ...result, toolEvents: collectedToolEvents },
       changedFiles: committableFiles,
       pauseId: record.id
     });
   }
 
+  await emitLifecycleEvent(onLifecycleEvent, "validating", "Summarizing validation feedback from the continuation.");
+  const review = await reviewGitHubRun({
+    provider: record.provider,
+    model: record.model,
+    repoFullName: record.repoFullName,
+    prompt: record.prompt,
+    rootPath,
+    result,
+    changedFiles: committableFiles
+  });
+  result = withReviewResult({ ...result, toolEvents: collectedToolEvents }, review);
+  await emitLifecycleEvent(
+    onLifecycleEvent,
+    "reviewing",
+    review.status === "approved" ? "Reviewer gate approved the continued changes." : "Reviewer gate found issues that need another continuation or a human decision.",
+    review.status === "approved" ? "completed" : "paused"
+  );
+
+  const gatedPauseReason = pauseReasonForResult(result);
+  if (gatedPauseReason) {
+    await emitLifecycleEvent(onLifecycleEvent, "needs_review", `Paused before PR creation: ${pauseReasonLabel(gatedPauseReason)}.`, "paused");
+    return pauseGitHubRun({
+      installationId: record.installationId,
+      repoFullName: record.repoFullName,
+      defaultBranch: record.defaultBranch,
+      branchName: record.branchName,
+      sandboxRoot: rootPath,
+      prompt: record.prompt,
+      provider: record.provider,
+      model: record.model,
+      mode: record.mode,
+      pauseReason: gatedPauseReason,
+      result,
+      changedFiles: committableFiles,
+      pauseId: record.id
+    });
+  }
+
+  await emitLifecycleEvent(onLifecycleEvent, "opening_pr", "Opening a pull request for the reviewed continuation.");
   const finalized = await finalizeGitHubRun({
     installationId: record.installationId,
     repoFullName: record.repoFullName,
@@ -312,7 +419,11 @@ export async function actOnPausedGitHubRun({
       text: `${record.resultText}\n\nOpened as a draft from a paused run. Pause reason: ${record.pauseReason}.`,
       toolEvents: record.toolEvents,
       status: "paused",
-      stopReason: record.pauseReason
+      lifecycleStatus: "paused",
+      stopReason: record.pauseReason,
+      acceptanceCriteria: record.acceptanceCriteria,
+      validation: record.validation,
+      review: record.review
     },
     changedFiles,
     mode: record.mode,
@@ -376,7 +487,8 @@ async function finalizeGitHubRun({
     pullRequestNumber: pullRequest.number,
     changedFiles,
     sandboxRoot: rootPath,
-    status: draft ? "completed" : result.status
+    status: draft ? "completed" : result.status,
+    lifecycleStatus: "completed"
   };
 }
 
@@ -428,7 +540,10 @@ async function pauseGitHubRun({
     toolEvents: result.toolEvents,
     resultText: result.text,
     changedFiles,
-    diffSummary
+    diffSummary,
+    acceptanceCriteria: result.acceptanceCriteria,
+    validation: result.validation,
+    review: result.review
   };
   await writePausedRun(record);
 
@@ -444,7 +559,11 @@ async function pauseGitHubRun({
     resumeAvailable: true,
     diffSummary,
     status: "paused",
+    lifecycleStatus: "paused",
     stopReason: pauseReason,
+    acceptanceCriteria: result.acceptanceCriteria,
+    validation: result.validation,
+    review: result.review,
     text: [
       result.text,
       "",
@@ -462,11 +581,407 @@ function pausedActionResult(record: PausedGitHubRunRecord, message: string): Git
     text: message,
     toolEvents: record.toolEvents,
     status: "completed",
+    lifecycleStatus: "completed",
+    acceptanceCriteria: record.acceptanceCriteria,
+    validation: record.validation,
+    review: record.review,
     repository: record.repoFullName,
     mode: record.mode,
     branchName: record.branchName,
     changedFiles: record.changedFiles,
     sandboxRoot: record.sandboxRoot
+  };
+}
+
+async function emitLifecycleEvent(
+  onLifecycleEvent: ((event: AgentLifecycleEvent) => void | Promise<void>) | undefined,
+  status: AgentLifecycleStatus,
+  message: string,
+  outcome: AgentLifecycleEvent["outcome"] = "completed"
+): Promise<void> {
+  if (!onLifecycleEvent) return;
+  const now = Date.now();
+  await onLifecycleEvent({
+    id: randomUUID(),
+    status,
+    message,
+    startedAt: now,
+    finishedAt: now,
+    durationMs: 0,
+    outcome
+  });
+}
+
+function enrichAgentRunResult(
+  result: AgentRunResponse,
+  toolEvents: AgentToolEvent[],
+  record?: Pick<PausedGitHubRunRecord, "acceptanceCriteria" | "validation" | "review">
+): AgentRunResponse {
+  const validation = validationChecksFromToolEvents(toolEvents, true);
+  return {
+    ...result,
+    toolEvents,
+    lifecycleStatus: result.lifecycleStatus || lifecycleStatusForResult(result),
+    acceptanceCriteria: result.acceptanceCriteria || record?.acceptanceCriteria,
+    validation: validation.length > 0 ? validation : result.validation || record?.validation,
+    review: result.review || record?.review
+  };
+}
+
+function lifecycleStatusForResult(result: AgentRunResponse): AgentLifecycleStatus {
+  if (result.status === "paused") return "paused";
+  if (result.status === "recovered") return "recovered";
+  return "completed";
+}
+
+function validationChecksFromToolEvents(toolEvents: AgentToolEvent[], includeNotRun: boolean): ValidationCheck[] {
+  const checks = toolEvents
+    .filter((event) => {
+      if (event.name !== "run_command") return false;
+      const command = asRecord(event.args).command;
+      return typeof command === "string" && validationCommandPattern.test(command);
+    })
+    .map((event) => {
+      const data = asRecord(event.result.data);
+      const args = asRecord(event.args);
+      const command = typeof data.command === "string"
+        ? data.command
+        : typeof args.command === "string"
+          ? args.command
+          : "validation command";
+      const output = [
+        typeof data.stdout === "string" ? data.stdout.trim() : "",
+        typeof data.stderr === "string" ? data.stderr.trim() : ""
+      ].filter(Boolean).join("\n\n");
+      const status: ValidationCheck["status"] = event.result.status === "completed"
+        ? "passed"
+        : event.result.status === "failed"
+          ? "failed"
+          : "unknown";
+
+      return {
+        command,
+        status,
+        summary: event.result.summary,
+        output: output ? truncateMiddle(output, 6_000) : undefined
+      };
+    });
+
+  if (checks.length > 0 || !includeNotRun) return checks;
+  return [{
+    command: "validation",
+    status: "not_run",
+    summary: "No validation command such as typecheck, lint, test, build, or check was detected in this run."
+  }];
+}
+
+async function reviewGitHubRun({
+  provider,
+  model,
+  repoFullName,
+  prompt,
+  rootPath,
+  result,
+  changedFiles
+}: {
+  provider: AgentProvider;
+  model?: string;
+  repoFullName: string;
+  prompt: string;
+  rootPath: string;
+  result: AgentRunResponse;
+  changedFiles: string[];
+}): Promise<AgentReviewResult> {
+  const validation = result.validation?.length
+    ? result.validation
+    : validationChecksFromToolEvents(result.toolEvents, true);
+  const fallbackCriteria = fallbackAcceptanceCriteria(prompt);
+  let diff = "(diff unavailable)";
+  try {
+    diff = await reviewDiff(rootPath, changedFiles);
+  } catch (error) {
+    diff = `Diff collection failed: ${errorMessage(error)}`;
+  }
+
+  if (provider === "mock") {
+    return heuristicReviewResult(fallbackCriteria, validation, changedFiles);
+  }
+
+  try {
+    const review = await runAgentTask({
+      provider,
+      model: reviewModelForProvider(provider, model),
+      prompt: buildReviewPrompt({
+        repoFullName,
+        userPrompt: prompt,
+        agentSummary: result.text,
+        changedFiles,
+        diff,
+        validation
+      }),
+      executor: disabledReviewExecutor,
+      toolsEnabled: false,
+      maxToolRounds: 1
+    });
+    return parseReviewResponse(review.text, fallbackCriteria, validation);
+  } catch (error) {
+    return {
+      status: "unknown",
+      summary: `Reviewer pass failed: ${errorMessage(error)}`,
+      findings: [
+        "The reviewer gate could not complete. Pause the run so a human can inspect the diff or continue with another model."
+      ],
+      acceptanceCriteria: fallbackCriteria,
+      validation
+    };
+  }
+}
+
+async function reviewDiff(rootPath: string, changedFiles: string[]): Promise<string> {
+  const diff = await runProcess("git", ["diff", "--", "."], rootPath, 20_000);
+  const untracked = await runProcess("git", ["ls-files", "--others", "--exclude-standard"], rootPath, 20_000);
+  const untrackedFiles = new Set(untracked.stdout.split(/\r?\n/).filter(Boolean));
+  const sections = [diff.stdout.trim()];
+
+  for (const file of changedFiles) {
+    if (!untrackedFiles.has(file)) continue;
+    const absolutePath = await resolveSandboxPath(rootPath, file);
+    if (!existsSync(absolutePath)) continue;
+    const info = await stat(absolutePath);
+    if (info.isDirectory()) continue;
+    const content = await readFile(absolutePath, "utf8");
+    sections.push([
+      `diff --git a/${file} b/${file}`,
+      "new file mode 100644",
+      `--- /dev/null`,
+      `+++ b/${file}`,
+      "@@ new file content @@",
+      truncateMiddle(content, 16_000)
+    ].join("\n"));
+  }
+
+  return truncateMiddle(sections.filter(Boolean).join("\n\n") || "(no diff)", 70_000);
+}
+
+function buildReviewPrompt({
+  repoFullName,
+  userPrompt,
+  agentSummary,
+  changedFiles,
+  diff,
+  validation
+}: {
+  repoFullName: string;
+  userPrompt: string;
+  agentSummary: string;
+  changedFiles: string[];
+  diff: string;
+  validation: ValidationCheck[];
+}): string {
+  return [
+    "Review this proposed GitHub repository agent run as an enterprise coding-agent quality gate.",
+    "Tools are disabled. Use only the request, agent summary, validation feedback, and diff below.",
+    "",
+    "Return only compact JSON with this shape:",
+    "{\"status\":\"approved|needs_work|unknown\",\"summary\":\"short reviewer summary\",\"acceptanceCriteria\":[{\"id\":\"AC1\",\"description\":\"criterion\",\"status\":\"met|partial|failed|unknown\",\"evidence\":\"specific diff or validation evidence\"}],\"validation\":[{\"command\":\"command\",\"status\":\"passed|failed|not_run|unknown\",\"summary\":\"result\"}],\"findings\":[\"specific issue\"]}",
+    "",
+    "Review standard:",
+    "- Derive 3 to 8 concrete acceptance criteria from the user's request before judging the diff.",
+    "- Approve only if the diff materially satisfies the requested workflow or behavior.",
+    "- Mark needs_work for superficial, color-only, placeholder, hardcoded, comment-only, unused, type-escape, or single-file guessed changes when the request needs broader implementation.",
+    "- Mark needs_work if validation failed, if obvious validation was skipped without a good reason, or if the diff introduces likely compile/runtime errors.",
+    "- Use unknown only when the provided diff and feedback are insufficient to judge safely.",
+    "- Keep evidence specific and concise.",
+    "",
+    `Repository: ${repoFullName}`,
+    "",
+    "User request:",
+    userPrompt,
+    "",
+    "Agent summary:",
+    truncateMiddle(agentSummary, 12_000),
+    "",
+    "Changed files:",
+    changedFiles.length > 0 ? changedFiles.map((file) => `- ${file}`).join("\n") : "- none",
+    "",
+    "Validation feedback:",
+    JSON.stringify(validation, null, 2),
+    "",
+    "Diff:",
+    diff
+  ].join("\n");
+}
+
+function parseReviewResponse(
+  text: string,
+  fallbackCriteria: AcceptanceCriterion[],
+  fallbackValidation: ValidationCheck[]
+): AgentReviewResult {
+  const parsed = parseJsonObject(text);
+  if (!parsed) {
+    return {
+      status: "unknown",
+      summary: "Reviewer did not return parseable JSON.",
+      findings: [truncateMiddle(text.trim() || "Empty reviewer response.", 2_000)],
+      acceptanceCriteria: fallbackCriteria,
+      validation: fallbackValidation
+    };
+  }
+
+  const criteria = normalizeAcceptanceCriteria(parsed.acceptanceCriteria, fallbackCriteria);
+  const validation = normalizeValidationChecks(parsed.validation, fallbackValidation);
+  const findings = Array.isArray(parsed.findings)
+    ? parsed.findings.filter((finding): finding is string => typeof finding === "string").slice(0, 12)
+    : [];
+  const status = parsed.status === "approved" || parsed.status === "needs_work" || parsed.status === "unknown"
+    ? parsed.status
+    : "unknown";
+
+  return {
+    status,
+    summary: typeof parsed.summary === "string" ? parsed.summary : "Reviewer returned structured feedback.",
+    findings,
+    acceptanceCriteria: criteria,
+    validation
+  };
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | undefined {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced?.[1] || text.match(/\{[\s\S]*\}/)?.[0] || text.trim();
+  try {
+    const parsed = JSON.parse(candidate);
+    return asRecord(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeAcceptanceCriteria(value: unknown, fallback: AcceptanceCriterion[]): AcceptanceCriterion[] {
+  if (!Array.isArray(value)) return fallback;
+  const criteria = value
+    .map((item, index): AcceptanceCriterion | undefined => {
+      const record = asRecord(item);
+      const description = typeof record.description === "string" ? record.description.trim() : "";
+      if (!description) return undefined;
+      return {
+        id: typeof record.id === "string" && record.id.trim() ? record.id.trim() : `AC${index + 1}`,
+        description,
+        status: normalizeCriterionStatus(record.status),
+        evidence: typeof record.evidence === "string" && record.evidence.trim() ? record.evidence.trim() : undefined
+      };
+    })
+    .filter((criterion): criterion is AcceptanceCriterion => Boolean(criterion))
+    .slice(0, 12);
+  return criteria.length > 0 ? criteria : fallback;
+}
+
+function normalizeCriterionStatus(value: unknown): AcceptanceCriterion["status"] {
+  return value === "met" || value === "partial" || value === "failed" || value === "unknown" ? value : "unknown";
+}
+
+function normalizeValidationChecks(value: unknown, fallback: ValidationCheck[]): ValidationCheck[] {
+  if (!Array.isArray(value)) return fallback;
+  const checks = value
+    .map((item): ValidationCheck | undefined => {
+      const record = asRecord(item);
+      const command = typeof record.command === "string" && record.command.trim() ? record.command.trim() : "";
+      if (!command) return undefined;
+      return {
+        command,
+        status: normalizeValidationStatus(record.status),
+        summary: typeof record.summary === "string" && record.summary.trim() ? record.summary.trim() : "Validation result reported by reviewer.",
+        output: typeof record.output === "string" && record.output.trim() ? truncateMiddle(record.output.trim(), 6_000) : undefined
+      };
+    })
+    .filter((check): check is ValidationCheck => Boolean(check))
+    .slice(0, 12);
+  return checks.length > 0 ? checks : fallback;
+}
+
+function normalizeValidationStatus(value: unknown): ValidationCheck["status"] {
+  return value === "passed" || value === "failed" || value === "not_run" || value === "unknown" ? value : "unknown";
+}
+
+function fallbackAcceptanceCriteria(prompt: string): AcceptanceCriterion[] {
+  const request = truncateMiddle(prompt.replace(/\s+/g, " ").trim(), 500);
+  return [
+    {
+      id: "AC1",
+      description: `The changes materially address the user request: ${request}`,
+      status: "unknown"
+    },
+    {
+      id: "AC2",
+      description: "The implementation updates the files that own the requested behavior instead of adding placeholders or superficial edits.",
+      status: "unknown"
+    },
+    {
+      id: "AC3",
+      description: "Relevant validation is run, or skipped validation is explicitly justified.",
+      status: "unknown"
+    }
+  ];
+}
+
+function heuristicReviewResult(
+  acceptanceCriteria: AcceptanceCriterion[],
+  validation: ValidationCheck[],
+  changedFiles: string[]
+): AgentReviewResult {
+  const failedValidation = validation.some((check) => check.status === "failed");
+  const noValidation = validation.every((check) => check.status === "not_run");
+  return {
+    status: failedValidation || changedFiles.length === 0 ? "needs_work" : "approved",
+    summary: "Mock reviewer produced a deterministic review from changed files and validation events.",
+    findings: [
+      ...(failedValidation ? ["At least one validation command failed."] : []),
+      ...(noValidation ? ["No validation command was detected; use a real provider for semantic review."] : [])
+    ],
+    acceptanceCriteria: acceptanceCriteria.map((criterion) => ({
+      ...criterion,
+      status: changedFiles.length > 0 ? "met" : "failed",
+      evidence: changedFiles.length > 0 ? `Changed files: ${changedFiles.join(", ")}` : "No changed files were produced."
+    })),
+    validation
+  };
+}
+
+function withReviewResult(result: AgentRunResponse, review: AgentReviewResult): AgentRunResponse {
+  const acceptanceCriteria = review.acceptanceCriteria;
+  const validation = review.validation.length > 0 ? review.validation : result.validation;
+  return {
+    ...result,
+    lifecycleStatus: reviewRequiresPause(review) ? "needs_review" : "completed",
+    acceptanceCriteria,
+    validation,
+    review,
+    stopReason: reviewRequiresPause(review) ? "review_failed" : result.stopReason
+  };
+}
+
+function reviewRequiresPause(review?: AgentReviewResult): boolean {
+  if (!review) return false;
+  if (review.status !== "approved") return true;
+  if (review.acceptanceCriteria.some((criterion) => criterion.status === "failed" || criterion.status === "partial")) return true;
+  if (review.validation.some((check) => check.status === "failed")) return true;
+  return false;
+}
+
+function reviewModelForProvider(provider: AgentProvider, selectedModel?: string): string | undefined {
+  const globalModel = process.env.GITHUB_REVIEW_MODEL || process.env.AGENT_REVIEW_MODEL;
+  if (globalModel) return globalModel;
+  if (provider === "openai") return process.env.OPENAI_REVIEW_MODEL || selectedModel;
+  if (provider === "anthropic") return process.env.ANTHROPIC_REVIEW_MODEL || selectedModel;
+  if (provider === "google") return process.env.GOOGLE_REVIEW_MODEL || selectedModel;
+  if (provider === "groq") return process.env.GROQ_REVIEW_MODEL || selectedModel;
+  return selectedModel;
+}
+
+async function disabledReviewExecutor(_name: DaemonToolName, _args: Record<string, unknown>): Promise<ToolResult> {
+  return {
+    status: "failed",
+    summary: "Tools are disabled for repository review."
   };
 }
 
@@ -565,12 +1080,40 @@ async function gitTool(rootPath: string, operation: "status" | "diff"): Promise<
 async function applyPatchTool(rootPath: string, args: Record<string, unknown>): Promise<ToolResult<PatchResult>> {
   const patch = typeof args.patch === "string" ? args.patch : "";
   if (!patch.trim()) return toolResult<PatchResult>("failed", "Missing patch.");
+  const validationError = validateUnifiedPatchInput(patch);
+  if (validationError) {
+    return toolResult<PatchResult>("failed", validationError, undefined, "medium");
+  }
+  const checked = await runProcess("git", ["apply", "--whitespace=nowarn", "--check", "-"], rootPath, 20_000, patch);
+  if (checked.exitCode !== 0) {
+    return toolResult<PatchResult>(
+      "failed",
+      `Patch failed validation before apply: ${checked.stderr || checked.stdout || "git apply --check failed"}`,
+      undefined,
+      "medium"
+    );
+  }
   const applied = await runProcess("git", ["apply", "--whitespace=nowarn", "-"], rootPath, 20_000, patch);
   if (applied.exitCode !== 0) {
     return toolResult<PatchResult>("failed", applied.stderr || "Patch failed to apply.", undefined, "medium");
   }
   const changedFiles = await changedFileNames(rootPath);
   return toolResult("completed", `Applied patch to ${changedFiles.length} file(s).`, { changedFiles });
+}
+
+function validateUnifiedPatchInput(patch: string): string | undefined {
+  const trimmed = patch.trim();
+  const hasFileHeader = /^diff --git\s+/m.test(trimmed) || /^---\s+/m.test(trimmed);
+  const hasNewFileHeader = /^\+\+\+\s+/m.test(trimmed);
+  const hasHunk = /^@@\s+/m.test(trimmed);
+
+  if (/^@@\s+/m.test(trimmed) && !hasFileHeader) {
+    return "Patch is a detached hunk. Send a complete unified diff with file headers, or use replace_text for exact localized edits.";
+  }
+  if (!hasFileHeader || !hasNewFileHeader || !hasHunk) {
+    return "Patch must be a complete unified diff with file headers (`diff --git` or `---`/`+++`) and valid `@@` hunk headers.";
+  }
+  return undefined;
 }
 
 async function createFileTool(rootPath: string, args: Record<string, unknown>): Promise<ToolResult<CreateFileResult>> {
@@ -995,9 +1538,17 @@ function fallbackGitHubTaskMode(prompt: string): ResolvedGitHubTaskMode {
   return "read";
 }
 
+function immediatePauseReasonForResult(result: AgentRunResponse): AgentRunResponse["stopReason"] | undefined {
+  if (result.stopReason === "max_tool_rounds" || result.stopReason === "provider_error") return result.stopReason;
+  return undefined;
+}
+
 function pauseReasonForResult(result: AgentRunResponse): AgentRunResponse["stopReason"] | undefined {
   if (result.stopReason === "max_tool_rounds" || result.stopReason === "provider_error") return result.stopReason;
   if (hasFailedValidation(result.toolEvents)) return "validation_failed";
+  if (result.validation?.some((check) => check.status === "failed")) return "validation_failed";
+  if (result.stopReason === "review_failed") return result.stopReason;
+  if (reviewRequiresPause(result.review)) return "review_failed";
   return undefined;
 }
 
@@ -1005,19 +1556,37 @@ function hasFailedValidation(toolEvents: AgentToolEvent[]): boolean {
   const latestValidation = [...toolEvents].reverse().find((event) => {
     if (event.name !== "run_command") return false;
     const command = asRecord(event.args).command;
-    return typeof command === "string" && /\b(typecheck|lint|test|build|check)\b/i.test(command);
+    return typeof command === "string" && validationCommandPattern.test(command);
   });
   return latestValidation?.result.status === "failed";
 }
 
 async function buildResumePrompt(record: PausedGitHubRunRecord, rootPath: string, continuation?: string): Promise<string> {
   const status = await runProcess("git", ["status", "--short"], rootPath, 20_000);
-  const diff = await runProcess("git", ["diff", "--", "."], rootPath, 20_000);
+  let diff = "(diff unavailable)";
+  try {
+    diff = await reviewDiff(rootPath, await changedFileNames(rootPath));
+  } catch (error) {
+    diff = `Diff collection failed: ${errorMessage(error)}`;
+  }
   const recentFailures = record.toolEvents
     .filter((event) => event.result.status !== "completed")
     .slice(-6)
     .map((event) => `- ${event.name}: ${event.result.summary}${compactCommandOutput(event)}`)
     .join("\n") || "- No failed tool calls were recorded before the pause.";
+  const criteriaFeedback = record.acceptanceCriteria?.length
+    ? record.acceptanceCriteria.map((criterion) => `- ${criterion.id} [${criterion.status}]: ${criterion.description}${criterion.evidence ? ` Evidence: ${criterion.evidence}` : ""}`).join("\n")
+    : "- No structured acceptance criteria were stored for this pause.";
+  const validationFeedback = record.validation?.length
+    ? record.validation.map((check) => `- ${check.command} [${check.status}]: ${check.summary}${check.output ? `\n  ${truncateMiddle(check.output, 3_000)}` : ""}`).join("\n")
+    : "- No validation feedback was stored for this pause.";
+  const reviewFeedback = record.review
+    ? [
+      `Reviewer status: ${record.review.status}`,
+      `Reviewer summary: ${record.review.summary}`,
+      record.review.findings.length > 0 ? `Findings:\n${record.review.findings.map((finding) => `- ${finding}`).join("\n")}` : "Findings: none"
+    ].join("\n")
+    : "No reviewer feedback was stored for this pause.";
 
   return [
     `Repository: ${record.repoFullName}`,
@@ -1041,11 +1610,20 @@ async function buildResumePrompt(record: PausedGitHubRunRecord, rootPath: string
     "Recent failed or blocked tool feedback:",
     recentFailures,
     "",
+    "Stored acceptance criteria feedback:",
+    criteriaFeedback,
+    "",
+    "Stored validation feedback:",
+    validationFeedback,
+    "",
+    "Stored reviewer feedback:",
+    reviewFeedback,
+    "",
     "Current git status:",
     status.stdout.trim() || "(clean)",
     "",
     "Current diff:",
-    truncateMiddle(diff.stdout.trim() || "(no diff)", 28_000)
+    truncateMiddle(diff.trim() || "(no diff)", 28_000)
   ].filter(Boolean).join("\n");
 }
 
@@ -1062,10 +1640,10 @@ function compactCommandOutput(event: AgentToolEvent): string {
 
 async function gitDiffSummary(rootPath: string): Promise<string> {
   const statResult = await runProcess("git", ["diff", "--stat", "--", "."], rootPath, 20_000);
-  const nameResult = await runProcess("git", ["diff", "--name-only", "--", "."], rootPath, 20_000);
+  const changedFiles = await changedFileNames(rootPath);
   return [
     statResult.stdout.trim(),
-    nameResult.stdout.trim() ? `\nChanged files:\n${nameResult.stdout.trim()}` : ""
+    changedFiles.length > 0 ? `\nChanged files:\n${changedFiles.join("\n")}` : ""
   ].filter(Boolean).join("\n") || "No diff.";
 }
 
@@ -1118,6 +1696,7 @@ function pauseReasonLabel(reason: NonNullable<AgentRunResponse["stopReason"]>): 
   if (reason === "max_tool_rounds") return "the run reached the tool-round checkpoint";
   if (reason === "provider_error") return "the model provider failed after partial progress";
   if (reason === "validation_failed") return "validation failed after file changes";
+  if (reason === "review_failed") return "the reviewer gate found unmet acceptance criteria";
   return reason;
 }
 
@@ -1139,9 +1718,30 @@ function prBody(prompt: string, result: AgentRunResponse, changedFiles: string[]
     "",
     ...changedFiles.map((file) => `- \`${file}\``),
     "",
+    "## Acceptance Criteria",
+    "",
+    ...(result.acceptanceCriteria?.length
+      ? result.acceptanceCriteria.map((criterion) => `- ${criterion.id} [${criterion.status}]: ${criterion.description}${criterion.evidence ? ` — ${criterion.evidence}` : ""}`)
+      : ["- No structured acceptance criteria were captured."]),
+    "",
+    "## Validation",
+    "",
+    ...(result.validation?.length
+      ? result.validation.map((check) => `- ${check.command} [${check.status}]: ${check.summary}`)
+      : ["- No validation checks were captured."]),
+    "",
+    "## Reviewer Gate",
+    "",
+    result.review ? `Status: ${result.review.status}` : "Status: not_run",
+    result.review ? `Summary: ${result.review.summary}` : "",
+    ...(result.review?.findings.length
+      ? ["", ...result.review.findings.map((finding) => `- ${finding}`)]
+      : []),
+    "",
     "## Run Status",
     "",
     `Status: ${result.status || "completed"}`,
+    result.lifecycleStatus ? `Lifecycle status: ${result.lifecycleStatus}` : "",
     result.stopReason ? `Stop reason: ${result.stopReason}` : "",
     "",
     "## Safety",
@@ -1161,6 +1761,7 @@ function recoverAgentRunResponse(
     model: model || "provider-default",
     toolEvents,
     status: "recovered",
+    lifecycleStatus: "recovered",
     stopReason: "provider_error",
     text: [
       "The model provider failed before returning a final response, so the repository workflow recovered from the error.",

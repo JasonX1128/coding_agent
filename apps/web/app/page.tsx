@@ -3,11 +3,15 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   DEFAULT_DAEMON_ORIGIN,
+  type AcceptanceCriterion,
+  type AgentLifecycleEvent,
   type AgentProvider,
+  type AgentReviewResult,
   type AgentRunResponse,
   type AgentStreamEvent,
   type AgentToolEvent,
   type AgentToolStartEvent,
+  type ValidationCheck,
   type Workspace
 } from "@coding-agent/shared";
 
@@ -276,6 +280,12 @@ export default function Home() {
         })
       });
       const data = await readAgentStream<GitHubTaskResult>(response, {
+        onLifecycleEvent: (event) => {
+          setGithubActivity((current) => [
+            ...current,
+            createActivityEntry(describeLifecycleEvent(event), activityToneForLifecycle(event), event.startedAt, `${event.id}:lifecycle`)
+          ]);
+        },
         onToolStart: (event) => {
           setGithubToolEvents((current) => upsertLiveToolEvent(current, event));
           setGithubActivity((current) => [
@@ -329,6 +339,12 @@ export default function Home() {
         body: JSON.stringify({ pauseId })
       });
       const data = await readAgentStream<GitHubTaskResult>(response, {
+        onLifecycleEvent: (event) => {
+          setGithubActivity((current) => [
+            ...current,
+            createActivityEntry(describeLifecycleEvent(event), activityToneForLifecycle(event), event.startedAt, `${event.id}:lifecycle`)
+          ]);
+        },
         onToolStart: (event) => {
           setGithubToolEvents((current) => upsertLiveToolEvent(current, event));
           setGithubActivity((current) => [
@@ -826,6 +842,7 @@ function GithubAgentPanel({
           "Install the GitHub App, load repositories, then select one and prompt the agent."
         )}
       </div>
+      <RunQualityPanel result={githubResult} />
       <pre className="chat-output">{githubResult?.text || "No GitHub agent result yet."}</pre>
 
       <div className="divider" />
@@ -876,6 +893,93 @@ function GithubAgentPanel({
       )}
     </section>
   );
+}
+
+function RunQualityPanel({ result }: { result: GitHubTaskResult | null }) {
+  if (result?.mode !== "write") return null;
+  const hasCriteria = Boolean(result?.acceptanceCriteria?.length);
+  const hasValidation = Boolean(result?.validation?.length);
+  const hasReview = Boolean(result?.review);
+  if (!hasCriteria && !hasValidation && !hasReview) return null;
+
+  return (
+    <div className="quality-panel">
+      <div className="quality-head">
+        <strong>Quality Gate</strong>
+        <span className={`quality-status ${qualityStatusClass(result?.review)}`}>
+          {qualityStatusLabel(result?.review)}
+        </span>
+      </div>
+      {result?.review ? (
+        <p className="quality-summary">{result.review.summary}</p>
+      ) : null}
+      {hasCriteria ? <AcceptanceCriteriaList criteria={result?.acceptanceCriteria || []} /> : null}
+      {hasValidation ? <ValidationList validation={result?.validation || []} /> : null}
+      {result?.review?.findings.length ? (
+        <details className="quality-details">
+          <summary>Reviewer findings ({result.review.findings.length})</summary>
+          <ul className="finding-list">
+            {result.review.findings.map((finding, index) => (
+              <li key={`${index}:${finding}`}>{finding}</li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function AcceptanceCriteriaList({ criteria }: { criteria: AcceptanceCriterion[] }) {
+  return (
+    <div className="quality-section">
+      <span className="hint">Acceptance criteria</span>
+      <div className="criteria-list">
+        {criteria.map((criterion) => (
+          <div className="criterion" key={criterion.id}>
+            <span className={`quality-status ${criterion.status}`}>{criterion.status}</span>
+            <div>
+              <strong>{criterion.id}</strong> {criterion.description}
+              {criterion.evidence ? <p>{criterion.evidence}</p> : null}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ValidationList({ validation }: { validation: ValidationCheck[] }) {
+  return (
+    <div className="quality-section">
+      <span className="hint">Validation</span>
+      <div className="validation-list">
+        {validation.map((check, index) => (
+          <details className="validation-item" key={`${check.command}:${index}`}>
+            <summary>
+              <span className={`quality-status ${check.status}`}>{check.status}</span>
+              <span>{check.command}</span>
+            </summary>
+            <p>{check.summary}</p>
+            {check.output ? <pre>{check.output}</pre> : null}
+          </details>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function qualityStatusLabel(review?: AgentReviewResult): string {
+  if (!review) return "not reviewed";
+  if (review.status === "approved") return "approved";
+  if (review.status === "needs_work") return "needs work";
+  return "unknown";
+}
+
+function qualityStatusClass(review?: AgentReviewResult): string {
+  if (!review) return "unknown";
+  if (review.status === "approved") return "met";
+  if (review.status === "needs_work") return "failed";
+  return "unknown";
 }
 
 function ToolEvents({ events, now }: { events: LiveToolEvent[]; now: number }) {
@@ -970,6 +1074,7 @@ function RunTimerBadge({ timer, now }: { timer: RunTimer | null; now: number }) 
 async function readAgentStream<T extends AgentRunResponse>(
   response: Response,
   handlers: {
+    onLifecycleEvent?: (event: AgentLifecycleEvent) => void;
     onToolStart: (event: AgentToolStartEvent) => void;
     onToolEvent: (event: AgentToolEvent) => void;
   }
@@ -988,6 +1093,10 @@ async function readAgentStream<T extends AgentRunResponse>(
   const handleLine = (line: string) => {
     if (!line.trim()) return;
     const event = JSON.parse(line) as AgentStreamEvent;
+    if (event.type === "lifecycle_event") {
+      handlers.onLifecycleEvent?.(event.event);
+      return;
+    }
     if (event.type === "tool_started") {
       handlers.onToolStart(event.event);
       return;
@@ -1075,6 +1184,17 @@ function activityToneForTool(event: AgentToolEvent): ActivityEntry["tone"] {
   return "info";
 }
 
+function describeLifecycleEvent(event: AgentLifecycleEvent): string {
+  return event.message;
+}
+
+function activityToneForLifecycle(event: AgentLifecycleEvent): ActivityEntry["tone"] {
+  if (event.outcome === "failed") return "error";
+  if (event.outcome === "paused") return "info";
+  if (event.outcome === "completed") return "done";
+  return "running";
+}
+
 function describeRunFinish(startedAt: number, finishedAt: number, toolEvents: AgentToolEvent[]): string {
   return `Finished in ${formatDuration(finishedAt - startedAt)} after ${toolEvents.length} tool call${toolEvents.length === 1 ? "" : "s"}.`;
 }
@@ -1091,6 +1211,7 @@ function pauseReasonText(reason?: AgentRunResponse["stopReason"]): string {
   if (reason === "max_tool_rounds") return "The run reached the tool-round checkpoint.";
   if (reason === "validation_failed") return "Validation failed after file changes.";
   if (reason === "provider_error") return "The model provider failed after partial progress.";
+  if (reason === "review_failed") return "The reviewer gate found unmet acceptance criteria.";
   return "The run needs a human decision before continuing.";
 }
 

@@ -428,6 +428,11 @@ async function replaceTextInFile(
 }
 
 async function applyUnifiedPatch(workspace: Workspace, patch: string): Promise<ToolResult<PatchResult>> {
+  const validationError = validateUnifiedPatchInput(patch);
+  if (validationError) {
+    return toolResult<PatchResult>("failed", validationError, undefined, "medium");
+  }
+
   const parsed = parsePatch(patch);
   if (parsed.length === 0) {
     return toolResult<PatchResult>("failed", "Patch did not contain any file changes.", undefined, "medium");
@@ -467,6 +472,21 @@ async function applyUnifiedPatch(workspace: Workspace, patch: string): Promise<T
   return toolResult("completed", `Applied patch to ${changedFiles.length} file(s).`, {
     changedFiles
   });
+}
+
+function validateUnifiedPatchInput(patch: string): string | undefined {
+  const trimmed = patch.trim();
+  const hasFileHeader = /^diff --git\s+/m.test(trimmed) || /^---\s+/m.test(trimmed);
+  const hasNewFileHeader = /^\+\+\+\s+/m.test(trimmed);
+  const hasHunk = /^@@\s+/m.test(trimmed);
+
+  if (/^@@\s+/m.test(trimmed) && !hasFileHeader) {
+    return "Patch is a detached hunk. Send a complete unified diff with file headers, or use replace_text for exact localized edits.";
+  }
+  if (!hasFileHeader || !hasNewFileHeader || !hasHunk) {
+    return "Patch must be a complete unified diff with file headers (`diff --git` or `---`/`+++`) and valid `@@` hunk headers.";
+  }
+  return undefined;
 }
 
 function cleanPatchFileName(fileName?: string): string | undefined {

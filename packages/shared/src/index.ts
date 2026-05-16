@@ -36,17 +36,77 @@ export type AgentToolStartEvent = {
   startedAt: number;
 };
 
+export type AgentLifecycleStatus =
+  | "classifying"
+  | "cloning"
+  | "planning"
+  | "editing"
+  | "validating"
+  | "reviewing"
+  | "opening_pr"
+  | "needs_review"
+  | "paused"
+  | "completed"
+  | "recovered";
+
+export type AgentLifecycleEvent = {
+  id: string;
+  status: AgentLifecycleStatus;
+  message: string;
+  startedAt: number;
+  finishedAt?: number;
+  durationMs?: number;
+  outcome?: "completed" | "failed" | "paused";
+};
+
+export type AcceptanceCriterionStatus = "met" | "partial" | "failed" | "unknown";
+
+export type AcceptanceCriterion = {
+  id: string;
+  description: string;
+  status: AcceptanceCriterionStatus;
+  evidence?: string;
+};
+
+export type ValidationCheckStatus = "passed" | "failed" | "not_run" | "unknown";
+
+export type ValidationCheck = {
+  command: string;
+  status: ValidationCheckStatus;
+  summary: string;
+  output?: string;
+};
+
+export type AgentReviewResult = {
+  status: "approved" | "needs_work" | "unknown";
+  summary: string;
+  findings: string[];
+  acceptanceCriteria: AcceptanceCriterion[];
+  validation: ValidationCheck[];
+};
+
+export type AgentStopReason =
+  | "max_tool_rounds"
+  | "provider_error"
+  | "validation_failed"
+  | "review_failed";
+
 export type AgentRunResponse = {
   provider: AgentProvider;
   model: string;
   text: string;
   toolEvents: AgentToolEvent[];
   status?: "completed" | "paused" | "recovered";
-  stopReason?: "max_tool_rounds" | "provider_error" | "validation_failed";
+  lifecycleStatus?: AgentLifecycleStatus;
+  stopReason?: AgentStopReason;
   maxToolRounds?: number;
+  acceptanceCriteria?: AcceptanceCriterion[];
+  validation?: ValidationCheck[];
+  review?: AgentReviewResult;
 };
 
 export type AgentStreamEvent =
+  | { type: "lifecycle_event"; event: AgentLifecycleEvent }
   | { type: "tool_started"; event: AgentToolStartEvent }
   | { type: "tool_event"; event: AgentToolEvent }
   | { type: "result"; result: AgentRunResponse }

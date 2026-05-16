@@ -284,6 +284,8 @@ function createMockAdapter(): AgentProviderAdapter {
         provider: "mock",
         model,
         toolEvents,
+        status: "completed",
+        lifecycleStatus: "completed",
         text: [
           "Mock mode is active, so no external LLM call was made.",
           `Prompt: ${request.prompt}`,
@@ -689,6 +691,7 @@ function providerResponse(
       : "The model completed without returning text."),
     toolEvents,
     status: stoppedByMaxRounds ? "paused" : "completed",
+    lifecycleStatus: stoppedByMaxRounds ? "paused" : "completed",
     ...options
   };
 }
