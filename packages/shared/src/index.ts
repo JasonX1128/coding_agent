@@ -1,3 +1,4 @@
+export * from "./chat.js";
 export const DEFAULT_DAEMON_ORIGIN = "http://127.0.0.1:4317";
 
 export type AgentMode = "local" | "github";

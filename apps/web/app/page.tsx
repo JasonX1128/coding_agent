@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
 import {
   DEFAULT_DAEMON_ORIGIN,
   type AgentProvider,
@@ -8,7 +7,9 @@ import {
   type AgentStreamEvent,
   type AgentToolEvent,
   type AgentToolStartEvent,
-  type Workspace
+  type Workspace,
+  type ChatSession,
+  type ChatMessage
 } from "@coding-agent/shared";
 
 type DaemonStatus = "unknown" | "online" | "offline";
@@ -102,6 +103,10 @@ export default function Home() {
   const [githubActivity, setGithubActivity] = useState<ActivityEntry[]>([]);
   const [githubPullRequests, setGithubPullRequests] = useState<GitHubPullRequest[]>([]);
   const [githubPullMessage, setGithubPullMessage] = useState("");
+
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
