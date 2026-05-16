@@ -921,6 +921,8 @@ function describeToolStart(event: AgentToolStartEvent): string {
       return "Reading the current git diff.";
     case "create_file":
       return `Creating ${stringArg(args.path, "a file")} with ${String(stringArg(args.content, "")).length} characters.`;
+    case "replace_text":
+      return `Replacing text in ${stringArg(args.path, "a file")}.`;
     case "apply_patch":
       return `Applying a patch with ${String(stringArg(args.patch, "")).length} characters.`;
     case "run_command":

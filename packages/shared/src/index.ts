@@ -85,6 +85,12 @@ export type PatchResult = {
   changedFiles: string[];
 };
 
+export type ReplaceTextResult = {
+  path: string;
+  replacements: number;
+  bytes: number;
+};
+
 export type CreateFileResult = {
   path: string;
   bytes: number;
@@ -105,5 +111,6 @@ export type DaemonToolName =
   | "git_status"
   | "git_diff"
   | "create_file"
+  | "replace_text"
   | "apply_patch"
   | "run_command";

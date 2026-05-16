@@ -72,7 +72,7 @@ model than the main coding model.
 1. Start `npm run dev`.
 2. In the web UI, connect to the daemon.
 3. Add a workspace root, for example this repository path.
-4. Use file search/read/git/diff/patch/command tools directly, or ask the chat panel to inspect the workspace.
+4. Use file search/read/git/diff/patch/command tools directly, or ask the chat panel to inspect and edit the workspace. The agent also has an exact replacement edit tool for localized changes.
 
 ## GitHub Repo Flow
 
@@ -128,7 +128,7 @@ inspection prompts run read-only and return a text response. Prompts that ask th
 agent to add, edit, fix, implement, or open a PR run in write mode.
 
 In write mode, the app clones the repository into `.agent-sandboxes/`, creates an
-`agent/*` branch, runs the agent with file/search/patch/git/command tools,
+`agent/*` branch, runs the agent with file/search/exact replacement/patch/git/command tools,
 commits non-empty changes, pushes the branch with a short-lived installation
 token, and opens a pull request against the repository default branch. If no
 non-empty file changes are produced, it returns the agent response without

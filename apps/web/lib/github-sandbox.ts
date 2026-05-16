@@ -11,6 +11,7 @@ import type {
   ListFilesResult,
   PatchResult,
   ReadFileResult,
+  ReplaceTextResult,
   SearchResult,
   ToolResult
 } from "@coding-agent/shared";
@@ -84,7 +85,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     model: request.model,
     prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt),
     executor,
-    maxToolRounds: 12,
+    maxToolRounds: mode === "write" ? 18 : 12,
     onToolStart: request.onToolStart,
     onToolEvent: request.onToolEvent
   });
@@ -170,6 +171,7 @@ function createWritableSandboxExecutor(rootPath: string): ToolExecutor {
       if (name === "git_status") return gitTool(rootPath, "status");
       if (name === "git_diff") return gitTool(rootPath, "diff");
       if (name === "create_file") return createFileTool(rootPath, args);
+      if (name === "replace_text") return replaceTextTool(rootPath, args);
       if (name === "apply_patch") return applyPatchTool(rootPath, args);
       if (name === "run_command") return runCommandTool(rootPath, args);
       return toolResult("failed", `Unsupported tool: ${name}`);
@@ -261,7 +263,7 @@ async function createFileTool(rootPath: string, args: Record<string, unknown>): 
 
   const absolutePath = await resolveSandboxPath(rootPath, requestedPath);
   if (existsSync(absolutePath) && !overwrite) {
-    return toolResult<CreateFileResult>("failed", "File already exists. Use apply_patch for edits, or overwrite=true only when replacing it intentionally.");
+    return toolResult<CreateFileResult>("failed", "File already exists. Use replace_text or apply_patch for edits, or overwrite=true only when replacing it intentionally.");
   }
 
   await mkdir(path.dirname(absolutePath), { recursive: true });
@@ -269,6 +271,42 @@ async function createFileTool(rootPath: string, args: Record<string, unknown>): 
   return toolResult("completed", `Created ${requestedPath}.`, {
     path: requestedPath,
     bytes: Buffer.byteLength(content, "utf8")
+  });
+}
+
+async function replaceTextTool(rootPath: string, args: Record<string, unknown>): Promise<ToolResult<ReplaceTextResult>> {
+  const requestedPath = typeof args.path === "string" ? args.path : "";
+  const oldText = typeof args.oldText === "string" ? args.oldText : "";
+  const newText = typeof args.newText === "string" ? args.newText : undefined;
+  const expectedReplacements = typeof args.expectedReplacements === "number"
+    ? Math.max(1, Math.min(100, Math.floor(args.expectedReplacements)))
+    : 1;
+
+  if (!requestedPath) return toolResult<ReplaceTextResult>("failed", "Missing file path.");
+  if (!oldText) return toolResult<ReplaceTextResult>("failed", "Missing oldText.");
+  if (newText === undefined) return toolResult<ReplaceTextResult>("failed", "Missing newText.");
+  if (oldText === newText) return toolResult<ReplaceTextResult>("failed", "Replacement would not change the file.");
+
+  const absolutePath = await resolveSandboxPath(rootPath, requestedPath);
+  if (!existsSync(absolutePath)) return toolResult<ReplaceTextResult>("failed", `File does not exist: ${requestedPath}`);
+
+  const original = await readFile(absolutePath, "utf8");
+  const replacements = countExactOccurrences(original, oldText);
+  if (replacements !== expectedReplacements) {
+    return toolResult<ReplaceTextResult>(
+      "failed",
+      `Expected ${expectedReplacements} exact replacement(s), found ${replacements}. Read the current file and retry with a unique exact oldText.`,
+      undefined,
+      "medium"
+    );
+  }
+
+  const next = original.split(oldText).join(newText);
+  await writeFile(absolutePath, next, "utf8");
+  return toolResult("completed", `Replaced ${replacements} occurrence(s) in ${requestedPath}.`, {
+    path: requestedPath,
+    replacements,
+    bytes: Buffer.byteLength(next, "utf8")
   });
 }
 
@@ -435,11 +473,35 @@ function buildRepositoryPrompt(
     `Working branch: ${branchName}`,
     "",
     "The user's prompt appears to request code or file changes, so write tools are enabled.",
+    "",
+    "Enterprise delivery loop:",
+    "1. Inspect the repository structure and identify the files that own the requested behavior.",
+    "2. Read the relevant source and styling files before editing.",
+    "3. Infer the user's product intent and define a cohesive implementation, not a superficial keyword or color-only change.",
+    "4. Use create_file for new text files, replace_text for exact localized edits, and apply_patch for larger existing-file edits.",
+    "5. Inspect git_diff after editing and verify the diff matches the user's request.",
+    "6. Run an obvious cheap check if one exists, such as typecheck, lint, or a focused test.",
+    "",
     "Do not stop with advice or a written plan when the user asks you to make changes.",
-    "Inspect the relevant files, then use create_file or apply_patch to implement the requested change.",
-    "Use create_file for new text files and apply_patch for edits to existing files.",
+    "For broad UI/design prompts, improve structure, density, hierarchy, spacing, states, and workflow fit as needed; do not treat the task as only changing colors.",
+    "When the user says something should look or feel like another tool, translate the relevant interaction and layout qualities into this app without copying protected branding or assets.",
+    "Use create_file for new text files, replace_text for exact localized edits, and apply_patch for larger existing-file edits.",
     "Do not use run_command to create or edit files.",
     "Do not use touch, echo, cat, tee, heredocs, or shell redirection for file edits.",
+    "",
+    "Replacement protocol:",
+    "Use replace_text when you have read the current file and can provide an exact oldText snippet with enough surrounding context to be unique.",
+    "If replace_text reports the wrong match count, read the current target lines before retrying with a more precise oldText.",
+    "",
+    "Patch protocol:",
+    "Prefer replace_text over apply_patch for small targeted edits.",
+    "Use complete unified diffs with `diff --git a/path b/path`, `---`, `+++`, and valid `@@` hunk headers.",
+    "Never submit patch fragments that start at `@@` without file headers.",
+    "Prefer small patches that touch one file or one coherent concern at a time.",
+    "If apply_patch fails, read the exact current lines around the target before retrying.",
+    "Do not retry the same malformed patch. Make the next patch smaller and anchored to current content.",
+    "After two failed patches on the same file, stop broad patching and make only a minimal single-hunk correction.",
+    "",
     "Before finishing, ensure any new file requested by the user has non-empty content.",
     "A pull request will be opened only if non-empty file changes are produced."
   ];
@@ -645,6 +707,17 @@ function toolResult<T>(
 function trimOutput(value: string): string {
   if (Buffer.byteLength(value, "utf8") <= maxOutputBytes) return value;
   return value.slice(-maxOutputBytes);
+}
+
+function countExactOccurrences(value: string, search: string): number {
+  if (!search) return 0;
+  let count = 0;
+  let index = value.indexOf(search);
+  while (index !== -1) {
+    count += 1;
+    index = value.indexOf(search, index + search.length);
+  }
+  return count;
 }
 
 function redact(value: string, secret?: string): string {

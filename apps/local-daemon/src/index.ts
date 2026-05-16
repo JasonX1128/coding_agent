@@ -13,6 +13,7 @@ import type {
   PatchResult,
   CreateFileResult,
   ReadFileResult,
+  ReplaceTextResult,
   SearchResult,
   ToolResult,
   Workspace
@@ -235,7 +236,7 @@ server.post("/tools/create_file", async (request, reply) => {
   const workspace = getWorkspace(body.workspaceId);
   const absolutePath = await resolveWorkspacePath(workspace, body.path);
   if (existsSync(absolutePath) && !body.overwrite) {
-    return reply.code(409).send(toolResult<CreateFileResult>("failed", "File already exists. Use overwrite=true only when replacing it intentionally."));
+    return reply.code(409).send(toolResult<CreateFileResult>("failed", "File already exists. Use replace_text or apply_patch for edits, or overwrite=true only when replacing it intentionally."));
   }
 
   await mkdir(path.dirname(absolutePath), { recursive: true });
@@ -244,6 +245,23 @@ server.post("/tools/create_file", async (request, reply) => {
     path: body.path,
     bytes: Buffer.byteLength(body.content, "utf8")
   });
+});
+
+server.post("/tools/replace_text", async (request, reply) => {
+  const body = z
+    .object({
+      workspaceId: z.string(),
+      path: z.string().min(1),
+      oldText: z.string().min(1),
+      newText: z.string(),
+      expectedReplacements: z.number().int().positive().max(100).optional().default(1)
+    })
+    .parse(request.body);
+
+  const workspace = getWorkspace(body.workspaceId);
+  const result = await replaceTextInFile(workspace, body.path, body.oldText, body.newText, body.expectedReplacements);
+  if (result.status === "failed") return reply.code(400).send(result);
+  return result;
 });
 
 server.post("/tools/run_command", async (request, reply) => {
@@ -373,6 +391,42 @@ async function listFiles(
   return files;
 }
 
+async function replaceTextInFile(
+  workspace: Workspace,
+  relativePath: string,
+  oldText: string,
+  newText: string,
+  expectedReplacements: number
+): Promise<ToolResult<ReplaceTextResult>> {
+  if (oldText === newText) {
+    return toolResult<ReplaceTextResult>("failed", "Replacement would not change the file.", undefined, "medium");
+  }
+
+  const targetPath = await resolveWorkspacePath(workspace, relativePath);
+  if (!existsSync(targetPath)) {
+    return toolResult<ReplaceTextResult>("failed", `File does not exist: ${relativePath}`, undefined, "medium");
+  }
+
+  const original = await readFile(targetPath, "utf8");
+  const replacements = countExactOccurrences(original, oldText);
+  if (replacements !== expectedReplacements) {
+    return toolResult<ReplaceTextResult>(
+      "failed",
+      `Expected ${expectedReplacements} exact replacement(s), found ${replacements}. Read the current file and retry with a unique exact oldText.`,
+      undefined,
+      "medium"
+    );
+  }
+
+  const next = original.split(oldText).join(newText);
+  await writeFile(targetPath, next, "utf8");
+  return toolResult("completed", `Replaced ${replacements} occurrence(s) in ${relativePath}.`, {
+    path: relativePath,
+    replacements,
+    bytes: Buffer.byteLength(next, "utf8")
+  });
+}
+
 async function applyUnifiedPatch(workspace: Workspace, patch: string): Promise<ToolResult<PatchResult>> {
   const parsed = parsePatch(patch);
   if (parsed.length === 0) {
@@ -486,6 +540,17 @@ async function runShellCommand(command: string, cwd: string, timeoutMs: number) 
 function trimOutput(value: string): string {
   if (Buffer.byteLength(value, "utf8") <= maxOutputBytes) return value;
   return value.slice(-maxOutputBytes);
+}
+
+function countExactOccurrences(value: string, search: string): number {
+  if (!search) return 0;
+  let count = 0;
+  let index = value.indexOf(search);
+  while (index !== -1) {
+    count += 1;
+    index = value.indexOf(search, index + search.length);
+  }
+  return count;
 }
 
 function toolResult<T>(

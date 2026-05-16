@@ -435,6 +435,7 @@ Upgrade path:
 
 - `apply_patch`
 - `create_file`
+- `replace_text`
 - `delete_file`
 - `format_files`
 - `update_dependency_manifest`
@@ -854,4 +855,3 @@ Mitigation: patch-size limits, plan-first flow, formatting discipline, tests, us
 - Anthropic tool use: https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
 - GitHub App REST API: https://docs.github.com/en/rest/apps/apps
 - GitHub App installation authentication: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation
-
