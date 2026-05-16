@@ -42,6 +42,7 @@ export type GitHubRepositoryTaskRequest = {
   model?: string;
   mode?: GitHubTaskMode;
   autopilot?: boolean;
+  signal?: AbortSignal;
   onLifecycleEvent?: (event: AgentLifecycleEvent) => void | Promise<void>;
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
@@ -101,6 +102,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
   const cloneUrl = tokenizedCloneUrl(repo.fullName, installationToken.token);
   const autopilot = request.autopilot === true;
   const autopilotWarnings: string[] = [];
+  throwIfAborted(request.signal);
   await emitLifecycleEvent(request.onLifecycleEvent, "classifying", "Classifying the repository prompt into read or write mode.");
   const mode = await resolveGitHubTaskMode({
     prompt: request.prompt,
@@ -112,23 +114,25 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
   const branchName = mode === "write" ? createAgentBranchName(request.prompt) : undefined;
 
   await emitLifecycleEvent(request.onLifecycleEvent, "cloning", `Cloning ${repo.fullName} into a disposable sandbox.`);
-  await runRequired("git", ["clone", "--depth", "1", cloneUrl, sandboxRoot], process.cwd(), 120_000, installationToken.token);
-  await runRequired("git", ["remote", "set-url", "origin", `https://github.com/${repo.fullName}.git`], sandboxRoot, 20_000);
+  await runRequired("git", ["clone", "--depth", "1", cloneUrl, sandboxRoot], process.cwd(), 120_000, installationToken.token, request.signal);
+  await runRequired("git", ["remote", "set-url", "origin", `https://github.com/${repo.fullName}.git`], sandboxRoot, 20_000, undefined, request.signal);
   if (mode === "write" && branchName) {
-    await runRequired("git", ["checkout", "-b", branchName], sandboxRoot, 20_000);
-    await runRequired("git", ["config", "user.name", `${process.env.GITHUB_APP_SLUG || "coding-agent"}[bot]`], sandboxRoot, 20_000);
+    await runRequired("git", ["checkout", "-b", branchName], sandboxRoot, 20_000, undefined, request.signal);
+    await runRequired("git", ["config", "user.name", `${process.env.GITHUB_APP_SLUG || "coding-agent"}[bot]`], sandboxRoot, 20_000, undefined, request.signal);
     await runRequired(
       "git",
       ["config", "user.email", `${process.env.GITHUB_APP_ID || "0"}+${process.env.GITHUB_APP_SLUG || "coding-agent"}[bot]@users.noreply.github.com`],
       sandboxRoot,
-      20_000
+      20_000,
+      undefined,
+      request.signal
     );
   }
   await emitLifecycleEvent(request.onLifecycleEvent, "cloning", `Sandbox ready for ${repo.fullName}.`);
 
   const rootPath = await realpath(sandboxRoot);
   const executor = mode === "write"
-    ? createWritableSandboxExecutor(rootPath, { allowHighRiskCommands: autopilot })
+    ? createWritableSandboxExecutor(rootPath, { allowHighRiskCommands: autopilot, signal: request.signal })
     : createReadOnlySandboxExecutor(rootPath);
   const collectedToolEvents: AgentToolEvent[] = [];
   let result: AgentRunResponse;
@@ -144,6 +148,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
       prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt, autopilot),
       executor,
       maxToolRounds: mode === "write" ? githubWriteMaxToolRounds() : 12,
+      signal: request.signal,
       onToolStart: request.onToolStart,
       onToolEvent: async (event) => {
         collectedToolEvents.push(event);
@@ -152,6 +157,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     });
     await emitLifecycleEvent(request.onLifecycleEvent, mode === "write" ? "editing" : "planning", "Agent tool loop completed.");
   } catch (error) {
+    if (isAbortError(error)) throw error;
     result = recoverAgentRunResponse(request.provider, request.model, collectedToolEvents, error);
     await emitLifecycleEvent(request.onLifecycleEvent, "recovered", "Recovered from a provider error after partial progress.", "failed");
   }
@@ -224,6 +230,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     collectedToolEvents,
     autopilot,
     autopilotWarnings,
+    signal: request.signal,
     onLifecycleEvent: request.onLifecycleEvent,
     onToolStart: request.onToolStart,
     onToolEvent: request.onToolEvent
@@ -288,19 +295,22 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     mode,
     draft: false,
     autopilot,
-    autopilotWarnings
+    autopilotWarnings,
+    signal: request.signal
   });
 }
 
 export async function resumeGitHubRepositoryTask({
   pauseId,
   continuation,
+  signal,
   onLifecycleEvent,
   onToolStart,
   onToolEvent
 }: {
   pauseId: string;
   continuation?: string;
+  signal?: AbortSignal;
   onLifecycleEvent?: (event: AgentLifecycleEvent) => void | Promise<void>;
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
@@ -310,11 +320,12 @@ export async function resumeGitHubRepositoryTask({
   const installationToken = await createInstallationToken(record.installationId);
   const autopilot = record.autopilot === true;
   const autopilotWarnings = [...(record.autopilotWarnings || [])];
-  const executor = createWritableSandboxExecutor(rootPath, { allowHighRiskCommands: autopilot });
+  const executor = createWritableSandboxExecutor(rootPath, { allowHighRiskCommands: autopilot, signal });
   const collectedToolEvents: AgentToolEvent[] = [...record.toolEvents];
   let result: AgentRunResponse;
 
   try {
+    throwIfAborted(signal);
     await emitLifecycleEvent(onLifecycleEvent, "editing", `Continuing paused repository run ${pauseId}.`);
     result = await runAgentTask({
       provider: record.provider,
@@ -322,6 +333,7 @@ export async function resumeGitHubRepositoryTask({
       prompt: await buildResumePrompt(record, rootPath, continuation),
       executor,
       maxToolRounds: githubWriteMaxToolRounds(),
+      signal,
       onToolStart,
       onToolEvent: async (event) => {
         collectedToolEvents.push(event);
@@ -330,6 +342,7 @@ export async function resumeGitHubRepositoryTask({
     });
     await emitLifecycleEvent(onLifecycleEvent, "editing", "Continuation tool loop completed.");
   } catch (error) {
+    if (isAbortError(error)) throw error;
     result = recoverAgentRunResponse(record.provider, record.model, collectedToolEvents, error);
     await emitLifecycleEvent(onLifecycleEvent, "recovered", "Recovered from a provider error during continuation.", "failed");
   }
@@ -386,6 +399,7 @@ export async function resumeGitHubRepositoryTask({
     collectedToolEvents,
     autopilot,
     autopilotWarnings,
+    signal,
     onLifecycleEvent,
     onToolStart,
     onToolEvent
@@ -450,7 +464,8 @@ export async function resumeGitHubRepositoryTask({
     mode: record.mode,
     draft: false,
     autopilot,
-    autopilotWarnings
+    autopilotWarnings,
+    signal
   });
   await deletePausedRun(record.id, false);
   return finalized;
@@ -526,7 +541,8 @@ async function finalizeGitHubRun({
   mode,
   draft,
   autopilot = false,
-  autopilotWarnings = []
+  autopilotWarnings = [],
+  signal
 }: {
   installationId: number;
   repoFullName: string;
@@ -541,15 +557,18 @@ async function finalizeGitHubRun({
   draft: boolean;
   autopilot?: boolean;
   autopilotWarnings?: string[];
+  signal?: AbortSignal;
 }): Promise<GitHubRepositoryTaskResult> {
-  await runRequired("git", ["add", "-A", "--", ...changedFiles], rootPath, 20_000);
-  await runRequired("git", ["commit", "-m", commitTitle(prompt)], rootPath, 60_000);
+  throwIfAborted(signal);
+  await runRequired("git", ["add", "-A", "--", ...changedFiles], rootPath, 20_000, undefined, signal);
+  await runRequired("git", ["commit", "-m", commitTitle(prompt)], rootPath, 60_000, undefined, signal);
   await runRequired(
     "git",
     ["push", tokenizedCloneUrl(repoFullName, installationToken), `HEAD:${branchName}`],
     rootPath,
     120_000,
-    installationToken
+    installationToken,
+    signal
   );
 
   const pullRequest = await openPullRequest({
@@ -796,6 +815,7 @@ async function runReviewRepairLoop({
   collectedToolEvents,
   autopilot,
   autopilotWarnings,
+  signal,
   onLifecycleEvent,
   onToolStart,
   onToolEvent
@@ -811,6 +831,7 @@ async function runReviewRepairLoop({
   collectedToolEvents: AgentToolEvent[];
   autopilot: boolean;
   autopilotWarnings: string[];
+  signal?: AbortSignal;
   onLifecycleEvent?: (event: AgentLifecycleEvent) => void | Promise<void>;
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
@@ -819,15 +840,17 @@ async function runReviewRepairLoop({
   let changedFiles = initialChangedFiles;
   const maxRepairAttempts = githubReviewRepairAttempts(autopilot);
 
-  for (let attempt = 0; attempt <= maxRepairAttempts; attempt += 1) {
+  for (let attempt = 0; ; attempt += 1) {
+    throwIfAborted(signal);
+    const attemptLabel = repairAttemptLabel(attempt, maxRepairAttempts);
     await emitLifecycleEvent(
       onLifecycleEvent,
       "validating",
       attempt === 0
         ? "Running automatic validation before reviewer gate."
-        : `Running automatic validation after reviewer repair ${attempt}/${maxRepairAttempts}.`
+        : `Running automatic validation after reviewer repair ${attemptLabel}.`
     );
-    const automaticValidation = await runAutomaticValidation(rootPath, changedFiles);
+    const automaticValidation = await runAutomaticValidation(rootPath, changedFiles, signal);
     result = withValidationResult(result, collectedToolEvents, automaticValidation);
 
     await emitLifecycleEvent(
@@ -835,7 +858,7 @@ async function runReviewRepairLoop({
       "reviewing",
       attempt === 0
         ? "Reviewing the proposed changes against the request and validation output."
-        : `Reviewing repaired changes, attempt ${attempt}/${maxRepairAttempts}.`
+        : `Reviewing repaired changes, attempt ${attemptLabel}.`
     );
     const review = await reviewGitHubRun({
       provider,
@@ -844,27 +867,30 @@ async function runReviewRepairLoop({
       prompt,
       rootPath,
       result,
-      changedFiles
+      changedFiles,
+      signal
     });
     result = withReviewResult({ ...result, toolEvents: collectedToolEvents }, review);
 
     const needsRepair = Boolean(pauseReasonForResult(result));
+    const repairBudgetExhausted = maxRepairAttempts !== undefined && attempt >= maxRepairAttempts;
     await emitLifecycleEvent(
       onLifecycleEvent,
       "reviewing",
       needsRepair
-        ? `Reviewer gate requested more work${attempt < maxRepairAttempts ? "; preparing a repair pass." : "; repair budget is exhausted."}`
+        ? `Reviewer gate requested more work${repairBudgetExhausted ? "; repair budget is exhausted." : "; preparing a repair pass."}`
         : "Reviewer gate approved the proposed changes.",
       needsRepair ? "paused" : "completed"
     );
 
-    if (!needsRepair || attempt >= maxRepairAttempts) {
+    if (!needsRepair || repairBudgetExhausted) {
       return { result: withAutopilotMetadata(result, autopilot, autopilotWarnings), changedFiles };
     }
 
     const diff = await safeReviewDiff(rootPath, changedFiles);
     try {
-      await emitLifecycleEvent(onLifecycleEvent, "editing", `Running reviewer repair ${attempt + 1}/${maxRepairAttempts}.`);
+      throwIfAborted(signal);
+      await emitLifecycleEvent(onLifecycleEvent, "editing", `Running reviewer repair ${repairAttemptLabel(attempt + 1, maxRepairAttempts)}.`);
       const repair = await runAgentTask({
         provider,
         model,
@@ -880,6 +906,7 @@ async function runReviewRepairLoop({
         }),
         executor,
         maxToolRounds: githubReviewRepairToolRounds(),
+        signal,
         onToolStart,
         onToolEvent: async (event) => {
           collectedToolEvents.push(event);
@@ -888,6 +915,7 @@ async function runReviewRepairLoop({
       });
       result = mergeRepairResult(result, repair, collectedToolEvents, attempt + 1);
     } catch (error) {
+      if (isAbortError(error)) throw error;
       result = mergeRepairResult(
         result,
         recoverAgentRunResponse(provider, model, collectedToolEvents, error),
@@ -938,10 +966,10 @@ function normalizeValidationCommandKey(command: string): string {
   return command.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-async function runAutomaticValidation(rootPath: string, changedFiles: string[]): Promise<ValidationCheck[]> {
+async function runAutomaticValidation(rootPath: string, changedFiles: string[], signal?: AbortSignal): Promise<ValidationCheck[]> {
   return [
     await runStaticAwarenessCheck(rootPath, changedFiles),
-    ...await runPackageValidationChecks(rootPath)
+    ...await runPackageValidationChecks(rootPath, signal)
   ];
 }
 
@@ -1031,7 +1059,7 @@ function localDeclarationExists(content: string, name: string): boolean {
   return new RegExp(`\\b(function|const|let|var)\\s+${name}\\b`).test(content);
 }
 
-async function runPackageValidationChecks(rootPath: string): Promise<ValidationCheck[]> {
+async function runPackageValidationChecks(rootPath: string, signal?: AbortSignal): Promise<ValidationCheck[]> {
   const packageJsonPath = path.join(rootPath, "package.json");
   if (!existsSync(packageJsonPath)) {
     return [{
@@ -1066,8 +1094,10 @@ async function runPackageValidationChecks(rootPath: string): Promise<ValidationC
 
   const checks: ValidationCheck[] = [];
   for (const { command, program, args } of commands.slice(0, 2)) {
+    throwIfAborted(signal);
     const startedAt = Date.now();
-    const result = await runProcess(program, args, rootPath, 120_000);
+    const result = await runProcess(program, args, rootPath, 120_000, undefined, false, undefined, signal);
+    throwIfAborted(signal);
     const output = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n\n");
     checks.push({
       command,
@@ -1107,7 +1137,8 @@ async function reviewGitHubRun({
   prompt,
   rootPath,
   result,
-  changedFiles
+  changedFiles,
+  signal
 }: {
   provider: AgentProvider;
   model?: string;
@@ -1116,6 +1147,7 @@ async function reviewGitHubRun({
   rootPath: string;
   result: AgentRunResponse;
   changedFiles: string[];
+  signal?: AbortSignal;
 }): Promise<AgentReviewResult> {
   const validation = result.validation?.length
     ? result.validation
@@ -1146,10 +1178,12 @@ async function reviewGitHubRun({
       }),
       executor: disabledReviewExecutor,
       toolsEnabled: false,
-      maxToolRounds: 1
+      maxToolRounds: 1,
+      signal
     });
     return parseReviewResponse(review.text, fallbackCriteria, validation);
   } catch (error) {
+    if (isAbortError(error)) throw error;
     return {
       status: "unknown",
       summary: `Reviewer pass failed: ${errorMessage(error)}`,
@@ -1245,6 +1279,10 @@ function buildReviewPrompt({
   ].join("\n");
 }
 
+function repairAttemptLabel(attempt: number, maxAttempts: number | undefined): string {
+  return maxAttempts === undefined ? `${attempt}/unlimited` : `${attempt}/${maxAttempts}`;
+}
+
 function buildReviewerRepairPrompt({
   repoFullName,
   userPrompt,
@@ -1262,7 +1300,7 @@ function buildReviewerRepairPrompt({
   changedFiles: string[];
   diff: string;
   attempt: number;
-  maxAttempts: number;
+  maxAttempts: number | undefined;
 }): string {
   return [
     "Continue the existing GitHub repository task by repairing only the issues identified by the reviewer and validation gate.",
@@ -1271,7 +1309,7 @@ function buildReviewerRepairPrompt({
     "Pay special attention to simple awareness bugs: imports, removed hooks, missing symbols, renamed identifiers, props, exports, and files that still reference code you changed.",
     "",
     `Repository: ${repoFullName}`,
-    `Repair attempt: ${attempt}/${maxAttempts}`,
+    `Repair attempt: ${repairAttemptLabel(attempt, maxAttempts)}`,
     "",
     "Original user request:",
     userPrompt,
@@ -1520,7 +1558,7 @@ function createReadOnlySandboxExecutor(rootPath: string): ToolExecutor {
 
 function createWritableSandboxExecutor(
   rootPath: string,
-  options: { allowHighRiskCommands?: boolean } = {}
+  options: { allowHighRiskCommands?: boolean; signal?: AbortSignal } = {}
 ): ToolExecutor {
   return async (name: DaemonToolName, args: Record<string, unknown>) => {
     try {
@@ -1700,7 +1738,7 @@ async function replaceTextTool(rootPath: string, args: Record<string, unknown>):
 async function runCommandTool(
   rootPath: string,
   args: Record<string, unknown>,
-  options: { allowHighRiskCommands?: boolean } = {}
+  options: { allowHighRiskCommands?: boolean; signal?: AbortSignal } = {}
 ): Promise<ToolResult<CommandResult>> {
   const command = typeof args.command === "string" ? args.command : "";
   if (!command) return toolResult<CommandResult>("failed", "Missing command.");
@@ -1710,7 +1748,8 @@ async function runCommandTool(
   }
 
   const startedAt = Date.now();
-  const result = await runProcess(command, [], rootPath, 60_000, undefined, true);
+  const result = await runProcess(command, [], rootPath, 60_000, undefined, true, undefined, options.signal);
+  throwIfAborted(options.signal);
   const summaryPrefix = risk === "high" && options.allowHighRiskCommands ? "Autopilot allowed high-risk command. " : "";
   return toolResult(result.exitCode === 0 ? "completed" : "failed", `${summaryPrefix}Command exited with code ${result.exitCode}.`, {
     command,
@@ -1797,8 +1836,9 @@ async function isTracked(rootPath: string, file: string): Promise<boolean> {
   return result.exitCode === 0;
 }
 
-async function runRequired(command: string, args: string[], cwd: string, timeoutMs: number, secret?: string): Promise<void> {
-  const result = await runProcess(command, args, cwd, timeoutMs, undefined, false, secret);
+async function runRequired(command: string, args: string[], cwd: string, timeoutMs: number, secret?: string, signal?: AbortSignal): Promise<void> {
+  const result = await runProcess(command, args, cwd, timeoutMs, undefined, false, secret, signal);
+  throwIfAborted(signal);
   if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || `${command} failed`);
 }
 
@@ -1809,13 +1849,38 @@ async function runProcess(
   timeoutMs: number,
   input?: string,
   shell = false,
-  secret?: string
+  secret?: string,
+  signal?: AbortSignal
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ exitCode: 1, stdout: "", stderr: "Run stopped by user." });
+      return;
+    }
     const child = spawn(command, args, { cwd, shell, env: sandboxEnv() });
     let stdout = "";
     let stderr = "";
+    let settled = false;
     const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (exitCode: number | null, output: { stdout?: string; stderr?: string } = {}) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({
+        exitCode,
+        stdout: redact(output.stdout ?? stdout, secret),
+        stderr: redact(output.stderr ?? stderr, secret)
+      });
+    };
+    const onAbort = () => {
+      child.kill("SIGTERM");
+      finish(1, { stderr: "Run stopped by user." });
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     child.stdout.on("data", (chunk: Buffer) => {
       stdout = trimOutput(stdout + chunk.toString());
@@ -1824,16 +1889,10 @@ async function runProcess(
       stderr = trimOutput(stderr + chunk.toString());
     });
     child.on("close", (exitCode: number | null) => {
-      clearTimeout(timer);
-      resolve({
-        exitCode,
-        stdout: redact(stdout, secret),
-        stderr: redact(stderr, secret)
-      });
+      finish(exitCode);
     });
     child.on("error", (error: Error) => {
-      clearTimeout(timer);
-      resolve({ exitCode: 1, stdout, stderr: error.message });
+      finish(1, { stderr: error.message });
     });
     if (input) child.stdin.end(input);
   });
@@ -2222,14 +2281,11 @@ function githubWriteMaxToolRounds(): number {
   return Number.isFinite(configured) ? Math.max(4, Math.min(80, Math.floor(configured))) : 18;
 }
 
-function githubReviewRepairAttempts(autopilot: boolean): number {
-  const configured = Number(
-    autopilot
-      ? process.env.GITHUB_AUTOPILOT_REVIEW_REPAIR_ATTEMPTS || process.env.GITHUB_REVIEW_REPAIR_ATTEMPTS
-      : process.env.GITHUB_REVIEW_REPAIR_ATTEMPTS
-  );
+function githubReviewRepairAttempts(autopilot: boolean): number | undefined {
+  if (autopilot) return undefined;
+  const configured = Number(process.env.GITHUB_REVIEW_REPAIR_ATTEMPTS);
   if (Number.isFinite(configured)) return Math.max(0, Math.min(8, Math.floor(configured)));
-  return autopilot ? 4 : 2;
+  return 2;
 }
 
 function githubReviewRepairToolRounds(): number {
@@ -2379,6 +2435,18 @@ function redact(value: string, secret?: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    const error = new Error("Run stopped by user.");
+    error.name = "AbortError";
+    throw error;
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function agentSandboxBase(): string {

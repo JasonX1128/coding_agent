@@ -32,6 +32,7 @@ export async function POST(request: Request) {
           model: body.model,
           mode: body.mode,
           autopilot: body.autopilot,
+          signal: request.signal,
           onLifecycleEvent: (event) => send({ type: "lifecycle_event", event }),
           onToolStart: (event) => send({ type: "tool_started", event }),
           onToolEvent: (event) => send({ type: "tool_event", event })

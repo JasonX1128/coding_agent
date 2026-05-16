@@ -62,7 +62,6 @@ GOOGLE_REVIEW_MODEL
 GROQ_REVIEW_MODEL
 GITHUB_WRITE_MAX_TOOL_ROUNDS
 GITHUB_REVIEW_REPAIR_ATTEMPTS
-GITHUB_AUTOPILOT_REVIEW_REPAIR_ATTEMPTS
 GITHUB_REVIEW_REPAIR_TOOL_ROUNDS
 ```
 
@@ -162,9 +161,9 @@ commands inside the disposable GitHub sandbox, and opens a PR when non-empty
 changes exist even if validation or the reviewer gate raises warnings. It still
 does not approve, merge, or push directly to the repository default branch.
 Autopilot warnings are written into the PR body and returned in the run result.
-Autopilot defaults to four reviewer repair attempts before it gives up and opens
-the PR anyway. Normal write runs default to two repair attempts before pausing
-for a human decision.
+Autopilot has no reviewer repair-attempt limit; use **Stop Run** in the web UI
+to end a long run manually. Normal write runs default to two repair attempts
+before pausing for a human decision.
 
 Coding prompts use a structured delivery loop: derive an implementation plan and
 acceptance criteria, inspect the owning files, implement against those criteria,

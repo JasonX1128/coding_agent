@@ -25,7 +25,8 @@ export async function POST(request: Request) {
       provider: body.provider as AgentProvider,
       model: body.model,
       mode: body.mode,
-      autopilot: body.autopilot
+      autopilot: body.autopilot,
+      signal: request.signal
     });
     return NextResponse.json(result);
   } catch (error) {

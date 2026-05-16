@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_DAEMON_ORIGIN,
   type AcceptanceCriterion,
@@ -116,6 +116,7 @@ export default function Home() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
+  const githubRunAbortRef = useRef<AbortController | null>(null);
 
   const selectedWorkspace = useMemo(
     () => workspaces.find((workspace) => workspace.id === workspaceId),
@@ -268,10 +269,14 @@ export default function Home() {
       "running",
       startedAt
     )]);
+    let controller: AbortController | null = null;
     try {
       if (!selectedGithubRepo) throw new Error("Select an installed GitHub repository first.");
+      controller = new AbortController();
+      githubRunAbortRef.current = controller;
       const response = await fetch("/api/github/tasks/stream", {
         method: "POST",
+        signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           installationId: selectedGithubRepo.installationId,
@@ -311,6 +316,13 @@ export default function Home() {
         createActivityEntry(describeGitHubRunFinish(startedAt, Date.now(), data), "done")
       ]);
     } catch (caught) {
+      if (isAbortError(caught)) {
+        setGithubActivity((current) => [
+          ...current,
+          createActivityEntry("GitHub run stopped by user.", "info")
+        ]);
+        return;
+      }
       setGithubActivity((current) => [
         ...current,
         createActivityEntry(`Run stopped with an error: ${errorMessage(caught)}`, "error")
@@ -320,6 +332,7 @@ export default function Home() {
       setGithubRunTimer((current) => current && current.startedAt === startedAt
         ? { ...current, finishedAt: Date.now() }
         : current);
+      if (githubRunAbortRef.current === controller) githubRunAbortRef.current = null;
       setBusy(null);
     }
   }
@@ -336,9 +349,13 @@ export default function Home() {
       ...current,
       createActivityEntry(`Continuing paused GitHub run ${pauseId}.`, "running", startedAt)
     ]);
+    let controller: AbortController | null = null;
     try {
+      controller = new AbortController();
+      githubRunAbortRef.current = controller;
       const response = await fetch("/api/github/tasks/resume/stream", {
         method: "POST",
+        signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pauseId })
       });
@@ -370,6 +387,13 @@ export default function Home() {
         createActivityEntry(describeGitHubRunFinish(startedAt, Date.now(), data), data.status === "paused" ? "info" : "done")
       ]);
     } catch (caught) {
+      if (isAbortError(caught)) {
+        setGithubActivity((current) => [
+          ...current,
+          createActivityEntry("GitHub resume stopped by user.", "info")
+        ]);
+        return;
+      }
       setGithubActivity((current) => [
         ...current,
         createActivityEntry(`Resume stopped with an error: ${errorMessage(caught)}`, "error")
@@ -379,8 +403,19 @@ export default function Home() {
       setGithubRunTimer((current) => current && current.startedAt === startedAt
         ? { ...current, finishedAt: Date.now() }
         : current);
+      if (githubRunAbortRef.current === controller) githubRunAbortRef.current = null;
       setBusy(null);
     }
+  }
+
+  function stopGithubAgent() {
+    const controller = githubRunAbortRef.current;
+    if (!controller) return;
+    controller.abort();
+    setGithubActivity((current) => [
+      ...current,
+      createActivityEntry("Stopping active GitHub run...", "info")
+    ]);
   }
 
   async function actOnPausedGithubRun(action: "open_draft_pr" | "stop" | "discard") {
@@ -624,6 +659,7 @@ export default function Home() {
                 loadGithubPullRequests={loadGithubPullRequests}
                 updateGithubPullRequest={updateGithubPullRequest}
                 runGithubAgent={runGithubAgent}
+                stopGithubAgent={stopGithubAgent}
                 resumeGithubAgent={resumeGithubAgent}
                 actOnPausedGithubRun={actOnPausedGithubRun}
                 busy={busy}
@@ -745,6 +781,7 @@ function GithubAgentPanel({
   loadGithubPullRequests,
   updateGithubPullRequest,
   runGithubAgent,
+  stopGithubAgent,
   resumeGithubAgent,
   actOnPausedGithubRun,
   busy,
@@ -766,6 +803,7 @@ function GithubAgentPanel({
   loadGithubPullRequests: () => void;
   updateGithubPullRequest: (number: number, action: "approve" | "close") => void;
   runGithubAgent: () => void;
+  stopGithubAgent: () => void;
   resumeGithubAgent: () => void;
   actOnPausedGithubRun: (action: "open_draft_pr" | "stop" | "discard") => void;
   busy: string | null;
@@ -775,6 +813,8 @@ function GithubAgentPanel({
   runTimer: RunTimer | null;
   now: number;
 }) {
+  const githubRunBusy = busy === "github-agent" || busy === "github-agent-resume";
+
   return (
     <section className="panel stack">
       <div className="section-header">
@@ -809,12 +849,19 @@ function GithubAgentPanel({
         />
         <span>
           <strong>Autopilot</strong>
-          <small>No pause checkpoints. High-risk sandbox commands are allowed.</small>
+          <small>No pause checkpoints or repair limit. High-risk sandbox commands are allowed.</small>
         </span>
       </label>
-      <button className="primary" disabled={busy === "github-agent" || !githubRepoFullName || !githubPrompt.trim()} onClick={runGithubAgent}>
-        Run Agent
-      </button>
+      <div className="row">
+        <button className="primary" disabled={githubRunBusy || !githubRepoFullName || !githubPrompt.trim()} onClick={runGithubAgent}>
+          Run Agent
+        </button>
+        {githubRunBusy ? (
+          <button className="danger" onClick={stopGithubAgent}>
+            Stop Run
+          </button>
+        ) : null}
+      </div>
       {githubResult?.status === "paused" && githubResult.pauseId ? (
         <div className="pause-box stack">
           <div>
@@ -1086,6 +1133,11 @@ function ActivityList({ entries }: { entries: ActivityEntry[] }) {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError"
+    || error instanceof Error && error.name === "AbortError";
 }
 
 function RunTimerBadge({ timer, now }: { timer: RunTimer | null; now: number }) {

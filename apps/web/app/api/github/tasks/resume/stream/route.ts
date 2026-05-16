@@ -22,6 +22,7 @@ export async function POST(request: Request) {
         const result = await resumeGitHubRepositoryTask({
           pauseId: body.pauseId,
           continuation: body.continuation,
+          signal: request.signal,
           onLifecycleEvent: (event) => send({ type: "lifecycle_event", event }),
           onToolStart: (event) => send({ type: "tool_started", event }),
           onToolEvent: (event) => send({ type: "tool_event", event })

@@ -19,6 +19,7 @@ export type AgentRunRequest = {
   executor: ToolExecutor;
   maxToolRounds?: number;
   toolsEnabled?: boolean;
+  signal?: AbortSignal;
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
 };
@@ -265,19 +266,22 @@ function createMockAdapter(): AgentProviderAdapter {
     provider: "mock",
     defaultModel: () => "mock-local",
     async run({ request, model, toolEvents }) {
+      throwIfAborted(request.signal);
       const fileResult = await executeToolCall(
         request.executor,
         { id: "mock-list-files", name: "list_files", args: { path: ".", maxFiles: 80 } },
         toolEvents,
         request.onToolStart,
-        request.onToolEvent
+        request.onToolEvent,
+        request.signal
       );
       const gitResult = await executeToolCall(
         request.executor,
         { id: "mock-git-status", name: "git_status", args: {} },
         toolEvents,
         request.onToolStart,
-        request.onToolEvent
+        request.onToolEvent,
+        request.signal
       );
 
       return {
@@ -315,8 +319,10 @@ function createOpenAIResponsesAdapter(): AgentProviderAdapter {
       let stopReason: AgentRunResponse["stopReason"];
 
       for (let round = 0; round < maxToolRounds; round += 1) {
+        throwIfAborted(request.signal);
         const response = await fetch("https://api.openai.com/v1/responses", {
           method: "POST",
+          signal: request.signal,
           headers: {
             Authorization: `Bearer ${apiKey}`,
             "Content-Type": "application/json"
@@ -339,7 +345,7 @@ function createOpenAIResponsesAdapter(): AgentProviderAdapter {
 
         const outputs = [];
         for (const call of turn.toolCalls) {
-          const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent);
+          const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent, request.signal);
           outputs.push({
             type: "function_call_output",
             call_id: call.id,
@@ -376,8 +382,10 @@ function createAnthropicMessagesAdapter(): AgentProviderAdapter {
       let stopReason: AgentRunResponse["stopReason"];
 
       for (let round = 0; round < maxToolRounds; round += 1) {
+        throwIfAborted(request.signal);
         const response = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
+          signal: request.signal,
           headers: {
             "x-api-key": apiKey,
             "anthropic-version": "2023-06-01",
@@ -407,7 +415,7 @@ function createAnthropicMessagesAdapter(): AgentProviderAdapter {
 
         const toolResults = [];
         for (const call of turn.toolCalls) {
-          const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent);
+          const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent, request.signal);
           toolResults.push({
             type: "tool_result",
             tool_use_id: call.id,
@@ -470,6 +478,7 @@ async function runGoogleGeminiModels({
   let stopReason: AgentRunResponse["stopReason"];
 
   for (let round = 0; round < maxToolRounds; round += 1) {
+    throwIfAborted(request.signal);
     const response = await requestGoogleTurnWithFallback({
       apiKey,
       request,
@@ -492,7 +501,7 @@ async function runGoogleGeminiModels({
 
     const resultParts = [];
     for (const call of turn.toolCalls) {
-      const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent);
+      const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent, request.signal);
       resultParts.push({
         functionResponse: {
           name: call.name,
@@ -538,6 +547,7 @@ async function requestGoogleTurnWithFallback({
           `https://generativelanguage.googleapis.com/v1beta/models/${googleModelPath(candidate)}:generateContent`,
           {
             method: "POST",
+            signal: request.signal,
             headers: {
               "x-goog-api-key": apiKey,
               "Content-Type": "application/json"
@@ -564,7 +574,7 @@ async function requestGoogleTurnWithFallback({
         const message = `Google model "${candidate}" attempt ${attempt}/${maxAttemptsPerModel} failed: ${errorMessage(error)}`;
         failures.push({ model: candidate, message });
         if (!shouldRetryGoogleModel(error) || attempt === maxAttemptsPerModel) break;
-        await sleep(googleRetryDelayMs(attempt));
+        await sleep(googleRetryDelayMs(attempt), request.signal);
       }
     }
   }
@@ -594,8 +604,10 @@ function createGroqChatCompletionsAdapter(): AgentProviderAdapter {
       let stopReason: AgentRunResponse["stopReason"];
 
       for (let round = 0; round < maxToolRounds; round += 1) {
+        throwIfAborted(request.signal);
         const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
           method: "POST",
+          signal: request.signal,
           headers: {
             Authorization: `Bearer ${apiKey}`,
             "Content-Type": "application/json"
@@ -618,7 +630,7 @@ function createGroqChatCompletionsAdapter(): AgentProviderAdapter {
         if (turn.toolCalls.length === 0) break;
 
         for (const call of turn.toolCalls) {
-          const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent);
+          const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent, request.signal);
           messages.push({
             role: "tool",
             tool_call_id: call.id,
@@ -642,15 +654,19 @@ async function executeToolCall(
   call: ModelToolCall,
   toolEvents: AgentToolEvent[],
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>,
-  onToolEvent?: (event: AgentToolEvent) => void | Promise<void>
+  onToolEvent?: (event: AgentToolEvent) => void | Promise<void>,
+  signal?: AbortSignal
 ): Promise<ToolResult> {
+  throwIfAborted(signal);
   const startedAt = Date.now();
   if (onToolStart) await onToolStart({ id: call.id, name: call.name, args: call.args, startedAt });
 
   let result: ToolResult;
   let executorError: unknown;
   try {
+    throwIfAborted(signal);
     result = await executor(call.name, call.args);
+    throwIfAborted(signal);
   } catch (error) {
     executorError = error;
     result = {
@@ -1058,8 +1074,32 @@ function googleRetryDelayMs(attempt: number): number {
   return Math.min(4_000, 500 * 2 ** Math.max(0, attempt - 1));
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function abortError(): Error {
+  const error = new Error("Run stopped by user.");
+  error.name = "AbortError";
+  return error;
 }
 
 function errorMessage(error: unknown): string {
