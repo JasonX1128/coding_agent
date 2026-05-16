@@ -33,7 +33,9 @@ Agent runs in the web UI stream tool events live. The Tool Events panel shows a
 tool as `running` as soon as the model requests it, updates that row when the
 tool completes, then fills in the chat output when the final model response
 arrives. Each running tool has a live per-call timer that freezes at completion,
-and the active Local/GitHub agent panel shows an overall run timer. The
+and the active Local/GitHub agent panel shows an overall run timer. The Run
+Activity panel narrates what the agent is doing from live stream events, then
+compresses to a summary with an expandable full log when the run finishes. The
 non-streaming JSON routes still exist for simple API clients.
 
 Supported provider environment variables:

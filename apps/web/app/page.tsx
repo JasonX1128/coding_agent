@@ -66,6 +66,13 @@ type RunTimer = {
   finishedAt?: number;
 };
 
+type ActivityEntry = {
+  id: string;
+  time: number;
+  message: string;
+  tone: "info" | "running" | "done" | "error";
+};
+
 export default function Home() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("local");
   const [daemonOrigin, setDaemonOrigin] = useState(DEFAULT_DAEMON_ORIGIN);
@@ -79,6 +86,7 @@ export default function Home() {
   const [agentResult, setAgentResult] = useState<AgentRunResponse | null>(null);
   const [localToolEvents, setLocalToolEvents] = useState<LiveToolEvent[]>([]);
   const [localRunTimer, setLocalRunTimer] = useState<RunTimer | null>(null);
+  const [localActivity, setLocalActivity] = useState<ActivityEntry[]>([]);
   const [toolOutput, setToolOutput] = useState<ToolPayload | null>(null);
   const [selectedFile, setSelectedFile] = useState("DEVELOPMENT_AGENT_PLAN.md");
   const [searchQuery, setSearchQuery] = useState("agent");
@@ -91,6 +99,7 @@ export default function Home() {
   const [githubResult, setGithubResult] = useState<GitHubTaskResult | null>(null);
   const [githubToolEvents, setGithubToolEvents] = useState<LiveToolEvent[]>([]);
   const [githubRunTimer, setGithubRunTimer] = useState<RunTimer | null>(null);
+  const [githubActivity, setGithubActivity] = useState<ActivityEntry[]>([]);
   const [githubPullRequests, setGithubPullRequests] = useState<GitHubPullRequest[]>([]);
   const [githubPullMessage, setGithubPullMessage] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -178,11 +187,17 @@ export default function Home() {
 
   async function runLocalAgent() {
     const startedAt = Date.now();
+    const runContext = selectedWorkspace?.rootPath || workspaceId;
     setBusy("agent");
     setError(null);
     setAgentResult(null);
     setLocalToolEvents([]);
     setLocalRunTimer({ startedAt });
+    setLocalActivity([createActivityEntry(
+      `Starting local run with ${provider}${model ? ` (${model})` : ""} in ${runContext}.`,
+      "running",
+      startedAt
+    )]);
     try {
       const response = await fetch("/api/agent/stream", {
         method: "POST",
@@ -198,13 +213,29 @@ export default function Home() {
       const data = await readAgentStream<AgentRunResponse>(response, {
         onToolStart: (event) => {
           setLocalToolEvents((current) => upsertLiveToolEvent(current, event));
+          setLocalActivity((current) => [
+            ...current,
+            createActivityEntry(describeToolStart(event), "running", event.startedAt, `${event.id}:start`)
+          ]);
         },
         onToolEvent: (event) => {
           setLocalToolEvents((current) => upsertLiveToolEvent(current, event));
+          setLocalActivity((current) => [
+            ...current,
+            createActivityEntry(describeToolFinish(event), activityToneForTool(event), event.finishedAt, `${event.id}:finish`)
+          ]);
         }
       });
       setAgentResult(data);
+      setLocalActivity((current) => [
+        ...current,
+        createActivityEntry(describeRunFinish(startedAt, Date.now(), data.toolEvents), "done")
+      ]);
     } catch (caught) {
+      setLocalActivity((current) => [
+        ...current,
+        createActivityEntry(`Run stopped with an error: ${errorMessage(caught)}`, "error")
+      ]);
       setError(errorMessage(caught));
     } finally {
       setLocalRunTimer((current) => current && current.startedAt === startedAt
@@ -221,6 +252,11 @@ export default function Home() {
     setGithubResult(null);
     setGithubToolEvents([]);
     setGithubRunTimer({ startedAt });
+    setGithubActivity([createActivityEntry(
+      `Starting GitHub repository run for ${selectedGithubRepo?.fullName || "the selected repository"} with ${provider}${model ? ` (${model})` : ""}.`,
+      "running",
+      startedAt
+    )]);
     try {
       if (!selectedGithubRepo) throw new Error("Select an installed GitHub repository first.");
       const response = await fetch("/api/github/tasks/stream", {
@@ -238,13 +274,29 @@ export default function Home() {
       const data = await readAgentStream<GitHubTaskResult>(response, {
         onToolStart: (event) => {
           setGithubToolEvents((current) => upsertLiveToolEvent(current, event));
+          setGithubActivity((current) => [
+            ...current,
+            createActivityEntry(describeToolStart(event), "running", event.startedAt, `${event.id}:start`)
+          ]);
         },
         onToolEvent: (event) => {
           setGithubToolEvents((current) => upsertLiveToolEvent(current, event));
+          setGithubActivity((current) => [
+            ...current,
+            createActivityEntry(describeToolFinish(event), activityToneForTool(event), event.finishedAt, `${event.id}:finish`)
+          ]);
         }
       });
       setGithubResult(data);
+      setGithubActivity((current) => [
+        ...current,
+        createActivityEntry(describeGitHubRunFinish(startedAt, Date.now(), data), "done")
+      ]);
     } catch (caught) {
+      setGithubActivity((current) => [
+        ...current,
+        createActivityEntry(`Run stopped with an error: ${errorMessage(caught)}`, "error")
+      ]);
       setError(errorMessage(caught));
     } finally {
       setGithubRunTimer((current) => current && current.startedAt === startedAt
@@ -350,6 +402,8 @@ export default function Home() {
   const eventList = activeTab === "github"
     ? githubResult?.toolEvents || githubToolEvents
     : agentResult?.toolEvents || localToolEvents;
+  const activityList = activeTab === "github" ? githubActivity : localActivity;
+  const activeRunTimer = activeTab === "github" ? githubRunTimer : localRunTimer;
 
   return (
     <main className="shell">
@@ -467,6 +521,11 @@ export default function Home() {
                 now={clockNow}
               />
             )}
+
+            <section className="panel stack">
+              <h2>Run Activity</h2>
+              <RunActivity entries={activityList} timer={activeRunTimer} now={clockNow} />
+            </section>
 
             <section className="panel stack">
               <h2>Tool Events</h2>
@@ -714,6 +773,54 @@ function ToolEvents({ events, now }: { events: LiveToolEvent[]; now: number }) {
   );
 }
 
+function RunActivity({ entries, timer, now }: { entries: ActivityEntry[]; timer: RunTimer | null; now: number }) {
+  if (entries.length === 0) {
+    return <div className="muted">No run activity yet.</div>;
+  }
+
+  const finished = Boolean(timer?.finishedAt);
+  const visibleEntries = finished ? entries.slice(-1) : entries.slice(-6);
+  const summary = describeActivitySummary(entries, timer, now);
+
+  if (finished) {
+    return (
+      <div className="activity-wrap">
+        <div className="activity-summary">
+          <strong>{summary}</strong>
+          <span className="hint">{entries[entries.length - 1]?.message}</span>
+        </div>
+        <details className="activity-details">
+          <summary>Open full run log ({entries.length} entries)</summary>
+          <ActivityList entries={entries} />
+        </details>
+      </div>
+    );
+  }
+
+  return (
+    <div className="activity-wrap">
+      <div className="activity-summary">
+        <strong>{summary}</strong>
+        <span className="hint">{entries[entries.length - 1]?.message}</span>
+      </div>
+      <ActivityList entries={visibleEntries} />
+    </div>
+  );
+}
+
+function ActivityList({ entries }: { entries: ActivityEntry[] }) {
+  return (
+    <ol className="activity-list">
+      {entries.map((entry) => (
+        <li className={`activity-item ${entry.tone}`} key={entry.id}>
+          <span className="activity-time">{formatClockTime(entry.time)}</span>
+          <span>{entry.message}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }
@@ -790,6 +897,97 @@ function upsertLiveToolEvent(events: LiveToolEvent[], event: LiveToolEvent): Liv
   ));
 }
 
+function createActivityEntry(
+  message: string,
+  tone: ActivityEntry["tone"],
+  time = Date.now(),
+  id = crypto.randomUUID()
+): ActivityEntry {
+  return { id, message, time, tone };
+}
+
+function describeToolStart(event: AgentToolStartEvent): string {
+  const args = asRecord(event.args);
+  switch (event.name) {
+    case "list_files":
+      return `Listing files in ${stringArg(args.path, ".")}${numberArg(args.maxFiles) ? `, up to ${numberArg(args.maxFiles)} entries` : ""}.`;
+    case "read_file":
+      return `Reading ${stringArg(args.path, "a file")}${lineRangeDescription(args)}.`;
+    case "search_text":
+      return `Searching for "${stringArg(args.query, "")}"${stringArg(args.glob) ? ` in ${stringArg(args.glob)}` : ""}.`;
+    case "git_status":
+      return "Checking git status.";
+    case "git_diff":
+      return "Reading the current git diff.";
+    case "create_file":
+      return `Creating ${stringArg(args.path, "a file")} with ${String(stringArg(args.content, "")).length} characters.`;
+    case "apply_patch":
+      return `Applying a patch with ${String(stringArg(args.patch, "")).length} characters.`;
+    case "run_command":
+      return `Running command: ${stringArg(args.command, "")}.`;
+    default:
+      return `Running ${event.name}.`;
+  }
+}
+
+function describeToolFinish(event: AgentToolEvent): string {
+  const status = event.result.status.replace("_", " ");
+  return `${capitalize(status)} ${event.name} in ${formatDuration(event.durationMs)}: ${event.result.summary}`;
+}
+
+function activityToneForTool(event: AgentToolEvent): ActivityEntry["tone"] {
+  if (event.result.status === "completed") return "done";
+  if (event.result.status === "failed") return "error";
+  return "info";
+}
+
+function describeRunFinish(startedAt: number, finishedAt: number, toolEvents: AgentToolEvent[]): string {
+  return `Finished in ${formatDuration(finishedAt - startedAt)} after ${toolEvents.length} tool call${toolEvents.length === 1 ? "" : "s"}.`;
+}
+
+function describeGitHubRunFinish(startedAt: number, finishedAt: number, result: GitHubTaskResult): string {
+  const base = describeRunFinish(startedAt, finishedAt, result.toolEvents);
+  if (result.pullRequestUrl) return `${base} Opened pull request #${result.pullRequestNumber}.`;
+  if (result.mode === "write") return `${base} Write-mode run completed without opening a pull request.`;
+  return `${base} Read-only repository response completed.`;
+}
+
+function describeActivitySummary(entries: ActivityEntry[], timer: RunTimer | null, now: number): string {
+  const elapsed = timer ? formatDuration(Math.max(0, (timer.finishedAt || now) - timer.startedAt)) : "0.0s";
+  if (timer?.finishedAt) {
+    const errors = entries.filter((entry) => entry.tone === "error").length;
+    return errors > 0
+      ? `Finished with ${errors} issue${errors === 1 ? "" : "s"} in ${elapsed}`
+      : `Finished in ${elapsed}`;
+  }
+  return `Working for ${elapsed}`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? value as Record<string, unknown> : {};
+}
+
+function stringArg(value: unknown, fallback = ""): string {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
+}
+
+function numberArg(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function lineRangeDescription(args: Record<string, unknown>): string {
+  const startLine = numberArg(args.startLine);
+  const endLine = numberArg(args.endLine);
+  if (startLine && endLine) return ` lines ${startLine}-${endLine}`;
+  if (startLine) return ` from line ${startLine}`;
+  if (endLine) return ` through line ${endLine}`;
+  return "";
+}
+
+function capitalize(value: string): string {
+  return value.slice(0, 1).toUpperCase() + value.slice(1);
+}
+
 function formatDuration(ms: number): string {
   const tenths = Math.max(0, Math.floor(ms / 100));
   const minutes = Math.floor(tenths / 600);
@@ -797,6 +995,14 @@ function formatDuration(ms: number): string {
   const remainder = tenths % 10;
   if (minutes > 0) return `${minutes}:${String(seconds).padStart(2, "0")}.${remainder}s`;
   return `${seconds}.${remainder}s`;
+}
+
+function formatClockTime(value: number): string {
+  return new Date(value).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
 }
 
 function formatRelativeDate(value: string): string {
