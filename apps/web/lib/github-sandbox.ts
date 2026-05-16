@@ -56,7 +56,12 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
   const installationToken = await createInstallationToken(repo.installationId);
   const sandboxRoot = await createSandboxRoot();
   const cloneUrl = tokenizedCloneUrl(repo.fullName, installationToken.token);
-  const mode = resolveGitHubTaskMode(request.prompt, request.mode || "auto");
+  const mode = await resolveGitHubTaskMode({
+    prompt: request.prompt,
+    requestedMode: request.mode || "auto",
+    provider: request.provider,
+    model: request.model
+  });
   const branchName = mode === "write" ? createAgentBranchName(request.prompt) : undefined;
 
   await runRequired("git", ["clone", "--depth", "1", cloneUrl, sandboxRoot], process.cwd(), 120_000, installationToken.token);
@@ -482,46 +487,120 @@ function humanTitle(prompt: string): string {
   return line || "apply requested changes";
 }
 
-export function resolveGitHubTaskMode(prompt: string, requestedMode: GitHubTaskMode = "auto"): ResolvedGitHubTaskMode {
+export type GitHubTaskModeResolutionRequest = {
+  prompt: string;
+  requestedMode?: GitHubTaskMode;
+  provider?: AgentProvider;
+  model?: string;
+};
+
+export async function resolveGitHubTaskMode({
+  prompt,
+  requestedMode = "auto",
+  provider = "mock",
+  model
+}: GitHubTaskModeResolutionRequest): Promise<ResolvedGitHubTaskMode> {
   if (requestedMode === "read" || requestedMode === "write") return requestedMode;
-  return promptLooksWriteIntent(prompt) ? "write" : "read";
+
+  const modelDecision = await classifyGitHubTaskModeWithModel({ prompt, provider, model });
+  return modelDecision || fallbackGitHubTaskMode(prompt);
 }
 
-const changeTargetPattern =
-  /\b(ui|ux|interface|screen|page|layout|style|styles|styling|css|theme|visual|design|component|button|panel|sidebar|toolbar|form|code|app|application|website|site|frontend|front[- ]end|view)\b/;
-const changeActionPattern =
-  /\b(make|build|create|add|write|edit|change|changes|update|updates|modify|fix|implement|refactor|remove|delete|rename|move|replace|redesign|restyle|polish|improve|revamp)\b/;
+async function classifyGitHubTaskModeWithModel({
+  prompt,
+  provider,
+  model
+}: {
+  prompt: string;
+  provider: AgentProvider;
+  model?: string;
+}): Promise<ResolvedGitHubTaskMode | undefined> {
+  if (provider === "mock") return undefined;
 
-function promptLooksWriteIntent(prompt: string): boolean {
+  try {
+    const result = await runAgentTask({
+      provider,
+      model: taskModeClassifierModel(provider, model),
+      prompt: [
+        "Classify whether a GitHub repository agent should run in read mode or write mode.",
+        "",
+        "Return only compact JSON with this shape:",
+        "{\"mode\":\"read\"|\"write\",\"reason\":\"short reason\"}",
+        "",
+        "Use read mode when the user asks for explanation, inspection, summary, review, recommendations, planning, comparison, or advice without asking you to change repository files.",
+        "Use write mode when the user asks you to make, apply, implement, add, edit, update, fix, remove, refactor, redesign, restyle, polish, or otherwise change repository files, code, docs, UI, styling, or configuration.",
+        "If the prompt says to make the required code changes, choose write.",
+        "If the prompt is ambiguous but asks you to do or make a repository change, choose write.",
+        "",
+        `User request: ${prompt}`
+      ].join("\n"),
+      executor: disabledClassifierExecutor,
+      toolsEnabled: false,
+      maxToolRounds: 1
+    });
+    return parseTaskModeClassifierResponse(result.text);
+  } catch {
+    return undefined;
+  }
+}
+
+function taskModeClassifierModel(provider: AgentProvider, selectedModel?: string): string | undefined {
+  const globalModel = process.env.GITHUB_TASK_MODE_MODEL || process.env.AGENT_TASK_MODE_MODEL;
+  if (globalModel) return globalModel;
+  if (provider === "openai") return process.env.OPENAI_TASK_MODE_MODEL || selectedModel;
+  if (provider === "anthropic") return process.env.ANTHROPIC_TASK_MODE_MODEL || selectedModel;
+  if (provider === "google") return process.env.GOOGLE_TASK_MODE_MODEL || selectedModel;
+  if (provider === "groq") return process.env.GROQ_TASK_MODE_MODEL || selectedModel;
+  return selectedModel;
+}
+
+async function disabledClassifierExecutor(): Promise<ToolResult> {
+  return {
+    status: "failed",
+    summary: "Tools are disabled for task-mode classification."
+  };
+}
+
+function parseTaskModeClassifierResponse(text: string): ResolvedGitHubTaskMode | undefined {
+  const trimmed = text.trim();
+  const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
+  const raw = jsonMatch ? jsonMatch[0] : trimmed;
+  try {
+    const parsed = JSON.parse(raw) as { mode?: unknown };
+    if (parsed.mode === "read" || parsed.mode === "write") return parsed.mode;
+  } catch {
+    const normalized = trimmed.toLowerCase();
+    if (/^\s*write\b/.test(normalized)) return "write";
+    if (/^\s*read\b/.test(normalized)) return "read";
+  }
+  return undefined;
+}
+
+function fallbackGitHubTaskMode(prompt: string): ResolvedGitHubTaskMode {
   const text = prompt.toLowerCase();
   const explicitReadOnlyPatterns = [
     /\b(do not edit|don't edit|no changes|read[- ]only|without changing|just tell me)\b/,
-    /^\s*(explain|summari[sz]e|describe|analy[sz]e|inspect|review|audit|find|look for|what|why|how|where|which|when|plan|recommend|compare)\b/
+    /^\s*(explain|summari[sz]e|describe|analy[sz]e|inspect|audit|find|look for|what|why|how|where|which|when|plan|recommend|compare)\b/,
+    /\b(tell me|what should|recommend|suggest|advice|ideas)\b/
   ];
-  const adviceOnlyPattern = /\b(tell me|what should|recommend|suggest|advice|ideas)\b/;
-  const directImplementationPattern =
-    /\b(make|apply|implement|edit|update|modify|fix|redesign|restyle|polish|improve|revamp|create|add|write)\b/;
   const textOnlyCreationPattern =
     /^\s*(please\s+|can you\s+|could you\s+|would you\s+|i want you to\s+)?(create|write|make)\s+(a\s+|an\s+)?(plan|summary|analysis|explanation|recommendation)\b/;
-  const fileArtifactPattern = /\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md)\b/;
+  const adviceOnlyPattern = /\b(tell me|what should|recommend|suggest|advice|ideas)\b/;
+  const implementationVerbPattern =
+    /\b(make|apply|implement|edit|update|modify|fix|redesign|restyle|polish|refactor|create|add|remove|delete)\b/;
   const pullRequestPattern = /\b(open|make|submit|raise)\b[\s\S]{0,40}\b(pr|pull request)\b/;
-  const writePatterns = [
-    /^\s*(please\s+|can you\s+|could you\s+|would you\s+|i want you to\s+|let'?s\s+)?(add|create|write|edit|change|update|modify|fix|implement|refactor|remove|delete|rename|move|replace|redesign|restyle|polish|improve|revamp)\b/,
-    /\b(fix|implement|add|create|write|edit|change|changes|update|updates|modify|refactor|remove|delete|rename|move|replace|redesign|restyle|polish|improve|revamp)\b[\s\S]{0,100}\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md|ui|ux|interface|layout|style|styles|styling|css|theme|visual|design|frontend|front[- ]end|page|screen)\b/,
-    /\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md|ui|ux|interface|layout|style|styles|styling|css|theme|visual|design|frontend|front[- ]end|page|screen)\b[\s\S]{0,100}\b(add|create|write|edit|change|changes|update|updates|modify|fix|implement|refactor|remove|delete|rename|move|replace|redesign|restyle|polish|improve|revamp)\b/,
-    /\bmake\b[\s\S]{0,80}\b(file|files|change|changes|edit|edits|update|updates|commit|code|ui|ux|interface|layout|style|styles|styling|css|theme|visual|design|frontend|front[- ]end|page|screen)\b/,
-    /\bmake\b[\s\S]{0,80}\b(look|feel|match|resemble)\b/,
-    /\bfix\s+(it|this|that)\b/
-  ];
+  const directChangePattern =
+    /\b(make|apply|implement|edit|change|changes|update|modify|fix|redesign|restyle|polish|refactor|create|add|remove|delete)\b/;
+  const repositoryTargetPattern =
+    /\b(code|file|files|ui|ux|interface|frontend|front[- ]end|css|style|styles|styling|layout|component|docs|readme|test|route|endpoint|config)\b/;
 
-  if (pullRequestPattern.test(text)) return true;
-  if (textOnlyCreationPattern.test(text) && !fileArtifactPattern.test(text)) return false;
-  if (adviceOnlyPattern.test(text) && !directImplementationPattern.test(text)) return false;
-  if (changeActionPattern.test(text) && changeTargetPattern.test(text)) return true;
-  if (explicitReadOnlyPatterns.some((pattern) => pattern.test(text)) && !writePatterns.some((pattern) => pattern.test(text))) {
-    return false;
-  }
-  return writePatterns.some((pattern) => pattern.test(text));
+  if (pullRequestPattern.test(text)) return "write";
+  if (textOnlyCreationPattern.test(text)) return "read";
+  if (adviceOnlyPattern.test(text) && !implementationVerbPattern.test(text)) return "read";
+  if (explicitReadOnlyPatterns.some((pattern) => pattern.test(text)) && !directChangePattern.test(text)) return "read";
+  if (directChangePattern.test(text) && repositoryTargetPattern.test(text)) return "write";
+  if (/\bmake\b[\s\S]{0,80}\b(look|feel|match|resemble)\b/.test(text)) return "write";
+  return "read";
 }
 
 function prBody(prompt: string, result: AgentRunResponse, changedFiles: string[]): string {

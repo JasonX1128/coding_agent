@@ -48,6 +48,11 @@ GOOGLE_MODEL
 GOOGLE_BACKUP_MODEL
 GOOGLE_LAST_RESORT_MODEL
 GROQ_API_KEY
+GITHUB_TASK_MODE_MODEL
+OPENAI_TASK_MODE_MODEL
+ANTHROPIC_TASK_MODE_MODEL
+GOOGLE_TASK_MODE_MODEL
+GROQ_TASK_MODE_MODEL
 ```
 
 The Google adapter defaults to `gemini-3.1-flash-lite` and falls back to
@@ -55,6 +60,12 @@ The Google adapter defaults to `gemini-3.1-flash-lite` and falls back to
 side effects occur. It also keeps `gemini-2.5-flash-lite` as a final safety net
 because provider-side availability can differ by key and model version. Override
 those with `GOOGLE_MODEL`, `GOOGLE_BACKUP_MODEL`, and `GOOGLE_LAST_RESORT_MODEL`.
+
+When GitHub repository tasks run in `auto` mode, the app asks the selected model
+to classify the prompt as `read` or `write` with tools disabled. Set
+`GITHUB_TASK_MODE_MODEL` or a provider-specific override such as
+`GOOGLE_TASK_MODE_MODEL` or `GROQ_TASK_MODE_MODEL` to use a smaller classifier
+model than the main coding model.
 
 ## Local Workspace Flow
 

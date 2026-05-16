@@ -18,6 +18,7 @@ export type AgentRunRequest = {
   prompt: string;
   executor: ToolExecutor;
   maxToolRounds?: number;
+  toolsEnabled?: boolean;
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
 };
@@ -239,7 +240,7 @@ function createOpenAIResponsesAdapter(): AgentProviderAdapter {
             instructions,
             input,
             previous_response_id: previousResponseId,
-            tools: toOpenAIResponsesTools()
+            tools: request.toolsEnabled === false ? undefined : toOpenAIResponsesTools()
           })
         });
 
@@ -295,7 +296,7 @@ function createAnthropicMessagesAdapter(): AgentProviderAdapter {
             max_tokens: 4096,
             system: instructions,
             messages,
-            tools: toAnthropicTools()
+            tools: request.toolsEnabled === false ? undefined : toAnthropicTools()
           })
         });
 
@@ -391,7 +392,7 @@ async function runGoogleGeminiModel({
               parts: [{ text: instructions }]
             },
             contents,
-            tools: [
+            tools: request.toolsEnabled === false ? undefined : [
               {
                 functionDeclarations: toGoogleFunctionDeclarations()
               }
@@ -457,8 +458,8 @@ function createGroqChatCompletionsAdapter(): AgentProviderAdapter {
           body: JSON.stringify({
             model,
             messages,
-            tools: toOpenAIChatTools(),
-            tool_choice: "auto"
+            tools: request.toolsEnabled === false ? undefined : toOpenAIChatTools(),
+            tool_choice: request.toolsEnabled === false ? undefined : "auto"
           })
         });
 
