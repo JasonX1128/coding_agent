@@ -36,17 +36,25 @@ export type AgentToolStartEvent = {
   startedAt: number;
 };
 
-export type AgentRunResponse = {
-  provider: AgentProvider;
-  model: string;
-  text: string;
-  toolEvents: AgentToolEvent[];
+export type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  toolEvents?: AgentToolEvent[];
+  timestamp: number;
+};
+
+export type Chat = {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: number;
 };
 
 export type AgentStreamEvent =
   | { type: "tool_started"; event: AgentToolStartEvent }
   | { type: "tool_event"; event: AgentToolEvent }
-  | { type: "result"; result: AgentRunResponse }
+  | { type: "result"; result: ChatMessage }
   | { type: "error"; error: string };
 
 export type ListFilesResult = {

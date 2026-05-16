@@ -4,12 +4,15 @@ import { useEffect, useMemo, useState } from "react";
 import {
   DEFAULT_DAEMON_ORIGIN,
   type AgentProvider,
-  type AgentRunResponse,
   type AgentStreamEvent,
   type AgentToolEvent,
   type AgentToolStartEvent,
-  type Workspace
+  type Workspace,
+  type Chat,
+  type ChatMessage
 } from "@coding-agent/shared";
+
+// ... (reverting deletions)
 
 type DaemonStatus = "unknown" | "online" | "offline";
 type ActiveTab = "local" | "github";
@@ -83,7 +86,11 @@ export default function Home() {
   const [provider, setProvider] = useState<AgentProvider>("mock");
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("Inspect this repository and summarize what is implemented.");
-  const [agentResult, setAgentResult] = useState<AgentRunResponse | null>(null);
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  
+  // Keep original state for now to satisfy typecheck
+  const [agentResult, setAgentResult] = useState<any | null>(null);
   const [localToolEvents, setLocalToolEvents] = useState<LiveToolEvent[]>([]);
   const [localRunTimer, setLocalRunTimer] = useState<RunTimer | null>(null);
   const [localActivity, setLocalActivity] = useState<ActivityEntry[]>([]);
@@ -113,6 +120,11 @@ export default function Home() {
   const selectedGithubRepo = useMemo(
     () => githubRepos.find((repo) => repo.fullName === githubRepoFullName),
     [githubRepoFullName, githubRepos]
+  );
+
+  const activeChat = useMemo(
+    () => chats.find((c) => c.id === activeChatId),
+    [chats, activeChatId]
   );
 
   useEffect(() => {

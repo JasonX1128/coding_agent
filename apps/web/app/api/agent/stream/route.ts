@@ -28,6 +28,8 @@ export async function POST(request: Request) {
       try {
         const body = bodySchema.parse(await request.json());
         const executor = createDaemonExecutor(body.daemonOrigin, body.workspaceId);
+        
+        const startTime = Date.now();
         const result = await runAgentTask({
           provider: body.provider as AgentProvider,
           model: body.model,
@@ -36,7 +38,17 @@ export async function POST(request: Request) {
           onToolStart: (event) => send({ type: "tool_started", event }),
           onToolEvent: (event) => send({ type: "tool_event", event })
         });
-        send({ type: "result", result });
+        
+        send({ 
+          type: "result", 
+          result: {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: result.text,
+            toolEvents: result.toolEvents,
+            timestamp: startTime
+          }
+        });
       } catch (error) {
         send({
           type: "error",
