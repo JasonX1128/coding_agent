@@ -494,16 +494,34 @@ async function executeToolCall(
   onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>,
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>
 ): Promise<ToolResult> {
-  if (onToolStart) await onToolStart({ id: call.id, name: call.name, args: call.args });
-  const result = await executor(call.name, call.args);
+  const startedAt = Date.now();
+  if (onToolStart) await onToolStart({ id: call.id, name: call.name, args: call.args, startedAt });
+
+  let result: ToolResult;
+  let executorError: unknown;
+  try {
+    result = await executor(call.name, call.args);
+  } catch (error) {
+    executorError = error;
+    result = {
+      status: "failed",
+      summary: errorMessage(error)
+    };
+  }
+
+  const finishedAt = Date.now();
   const event: AgentToolEvent = {
     id: call.id,
     name: call.name,
     args: call.args,
+    startedAt,
+    finishedAt,
+    durationMs: finishedAt - startedAt,
     result
   };
   toolEvents.push(event);
   if (onToolEvent) await onToolEvent(event);
+  if (executorError) throw executorError;
   return result;
 }
 

@@ -32,7 +32,9 @@ If no provider API key is configured, select `mock` in the UI. Mock mode still e
 Agent runs in the web UI stream tool events live. The Tool Events panel shows a
 tool as `running` as soon as the model requests it, updates that row when the
 tool completes, then fills in the chat output when the final model response
-arrives. The non-streaming JSON routes still exist for simple API clients.
+arrives. Each running tool has a live per-call timer that freezes at completion,
+and the active Local/GitHub agent panel shows an overall run timer. The
+non-streaming JSON routes still exist for simple API clients.
 
 Supported provider environment variables:
 

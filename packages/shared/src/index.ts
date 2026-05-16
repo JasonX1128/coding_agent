@@ -23,6 +23,9 @@ export type AgentToolEvent = {
   id: string;
   name: string;
   args: unknown;
+  startedAt: number;
+  finishedAt: number;
+  durationMs: number;
   result: ToolResult;
 };
 
@@ -30,6 +33,7 @@ export type AgentToolStartEvent = {
   id: string;
   name: string;
   args: unknown;
+  startedAt: number;
 };
 
 export type AgentRunResponse = {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   DEFAULT_DAEMON_ORIGIN,
   type AgentProvider,
@@ -57,6 +57,13 @@ type GitHubPullRequest = {
 
 type LiveToolEvent = AgentToolStartEvent & {
   result?: AgentToolEvent["result"];
+  finishedAt?: number;
+  durationMs?: number;
+};
+
+type RunTimer = {
+  startedAt: number;
+  finishedAt?: number;
 };
 
 export default function Home() {
@@ -71,6 +78,7 @@ export default function Home() {
   const [prompt, setPrompt] = useState("Inspect this repository and summarize what is implemented.");
   const [agentResult, setAgentResult] = useState<AgentRunResponse | null>(null);
   const [localToolEvents, setLocalToolEvents] = useState<LiveToolEvent[]>([]);
+  const [localRunTimer, setLocalRunTimer] = useState<RunTimer | null>(null);
   const [toolOutput, setToolOutput] = useState<ToolPayload | null>(null);
   const [selectedFile, setSelectedFile] = useState("DEVELOPMENT_AGENT_PLAN.md");
   const [searchQuery, setSearchQuery] = useState("agent");
@@ -82,10 +90,12 @@ export default function Home() {
   const [githubPrompt, setGithubPrompt] = useState("Inspect this repository and summarize what it does.");
   const [githubResult, setGithubResult] = useState<GitHubTaskResult | null>(null);
   const [githubToolEvents, setGithubToolEvents] = useState<LiveToolEvent[]>([]);
+  const [githubRunTimer, setGithubRunTimer] = useState<RunTimer | null>(null);
   const [githubPullRequests, setGithubPullRequests] = useState<GitHubPullRequest[]>([]);
   const [githubPullMessage, setGithubPullMessage] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [clockNow, setClockNow] = useState(() => Date.now());
 
   const selectedWorkspace = useMemo(
     () => workspaces.find((workspace) => workspace.id === workspaceId),
@@ -95,6 +105,11 @@ export default function Home() {
     () => githubRepos.find((repo) => repo.fullName === githubRepoFullName),
     [githubRepoFullName, githubRepos]
   );
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setClockNow(Date.now()), 200);
+    return () => window.clearInterval(interval);
+  }, []);
 
   async function connectDaemon() {
     setBusy("daemon");
@@ -162,10 +177,12 @@ export default function Home() {
   }
 
   async function runLocalAgent() {
+    const startedAt = Date.now();
     setBusy("agent");
     setError(null);
     setAgentResult(null);
     setLocalToolEvents([]);
+    setLocalRunTimer({ startedAt });
     try {
       const response = await fetch("/api/agent/stream", {
         method: "POST",
@@ -190,15 +207,20 @@ export default function Home() {
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
+      setLocalRunTimer((current) => current && current.startedAt === startedAt
+        ? { ...current, finishedAt: Date.now() }
+        : current);
       setBusy(null);
     }
   }
 
   async function runGithubAgent() {
+    const startedAt = Date.now();
     setBusy("github-agent");
     setError(null);
     setGithubResult(null);
     setGithubToolEvents([]);
+    setGithubRunTimer({ startedAt });
     try {
       if (!selectedGithubRepo) throw new Error("Select an installed GitHub repository first.");
       const response = await fetch("/api/github/tasks/stream", {
@@ -225,6 +247,9 @@ export default function Home() {
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
+      setGithubRunTimer((current) => current && current.startedAt === startedAt
+        ? { ...current, finishedAt: Date.now() }
+        : current);
       setBusy(null);
     }
   }
@@ -419,6 +444,8 @@ export default function Home() {
                 runLocalAgent={runLocalAgent}
                 busy={busy}
                 agentResult={agentResult}
+                runTimer={localRunTimer}
+                now={clockNow}
               />
             ) : (
               <GithubAgentPanel
@@ -436,12 +463,14 @@ export default function Home() {
                 githubResult={githubResult}
                 githubPullRequests={githubPullRequests}
                 githubPullMessage={githubPullMessage}
+                runTimer={githubRunTimer}
+                now={clockNow}
               />
             )}
 
             <section className="panel stack">
               <h2>Tool Events</h2>
-              <ToolEvents events={eventList || []} />
+              <ToolEvents events={eventList || []} now={clockNow} />
             </section>
           </div>
 
@@ -504,17 +533,24 @@ function LocalAgentPanel({
   setPrompt,
   runLocalAgent,
   busy,
-  agentResult
+  agentResult,
+  runTimer,
+  now
 }: {
   prompt: string;
   setPrompt: (value: string) => void;
   runLocalAgent: () => void;
   busy: string | null;
   agentResult: AgentRunResponse | null;
+  runTimer: RunTimer | null;
+  now: number;
 }) {
   return (
     <section className="panel stack">
-      <h2>Local Agent</h2>
+      <div className="section-header">
+        <h2>Local Agent</h2>
+        <RunTimerBadge timer={runTimer} now={now} />
+      </div>
       <textarea rows={6} value={prompt} onChange={(event) => setPrompt(event.target.value)} />
       <button className="primary" disabled={busy === "agent" || !prompt.trim()} onClick={runLocalAgent}>
         Run Local Agent
@@ -538,7 +574,9 @@ function GithubAgentPanel({
   busy,
   githubResult,
   githubPullRequests,
-  githubPullMessage
+  githubPullMessage,
+  runTimer,
+  now
 }: {
   githubInstallUrl: string;
   githubRepos: GitHubRepository[];
@@ -554,10 +592,15 @@ function GithubAgentPanel({
   githubResult: GitHubTaskResult | null;
   githubPullRequests: GitHubPullRequest[];
   githubPullMessage: string;
+  runTimer: RunTimer | null;
+  now: number;
 }) {
   return (
     <section className="panel stack">
-      <h2>GitHub Agent</h2>
+      <div className="section-header">
+        <h2>GitHub Agent</h2>
+        <RunTimerBadge timer={runTimer} now={now} />
+      </div>
       <div className="row">
         <a className="button-link" href={githubInstallUrl}>
           Install App
@@ -644,27 +687,45 @@ function GithubAgentPanel({
   );
 }
 
-function ToolEvents({ events }: { events: LiveToolEvent[] }) {
+function ToolEvents({ events, now }: { events: LiveToolEvent[]; now: number }) {
   if (events.length === 0) {
     return <div className="muted">No tool events yet.</div>;
   }
 
   return (
     <div className="stack">
-      {events.map((event) => (
-        <div className="event" key={event.id}>
-          <strong>
-            {event.name} · {event.result?.status || "running"}
-          </strong>
-          <p>{event.result?.summary || "Tool call requested."}</p>
-        </div>
-      ))}
+      {events.map((event) => {
+        const elapsedMs = event.durationMs ?? Math.max(0, (event.finishedAt || now) - event.startedAt);
+        return (
+          <div className="event" key={event.id}>
+            <div className="event-head">
+              <strong>
+                {event.name} · {event.result?.status || "running"}
+              </strong>
+              <span className={`timer-chip ${event.finishedAt ? "done" : "running"}`}>
+                {formatDuration(elapsedMs)}
+              </span>
+            </div>
+            <p>{event.result?.summary || "Tool call requested."}</p>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
+}
+
+function RunTimerBadge({ timer, now }: { timer: RunTimer | null; now: number }) {
+  if (!timer) return <span className="timer-badge idle">idle</span>;
+  const elapsedMs = Math.max(0, (timer.finishedAt || now) - timer.startedAt);
+  return (
+    <span className={`timer-badge ${timer.finishedAt ? "done" : "running"}`}>
+      {timer.finishedAt ? "done" : "running"} · {formatDuration(elapsedMs)}
+    </span>
+  );
 }
 
 async function readAgentStream<T extends AgentRunResponse>(
@@ -727,6 +788,15 @@ function upsertLiveToolEvent(events: LiveToolEvent[], event: LiveToolEvent): Liv
   return events.map((candidate, candidateIndex) => (
     candidateIndex === index ? { ...candidate, ...event } : candidate
   ));
+}
+
+function formatDuration(ms: number): string {
+  const tenths = Math.max(0, Math.floor(ms / 100));
+  const minutes = Math.floor(tenths / 600);
+  const seconds = Math.floor((tenths % 600) / 10);
+  const remainder = tenths % 10;
+  if (minutes > 0) return `${minutes}:${String(seconds).padStart(2, "0")}.${remainder}s`;
+  return `${seconds}.${remainder}s`;
 }
 
 function formatRelativeDate(value: string): string {
