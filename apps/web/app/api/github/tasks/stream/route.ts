@@ -30,6 +30,7 @@ export async function POST(request: Request) {
           provider: body.provider as AgentProvider,
           model: body.model,
           mode: body.mode,
+          onToolStart: (event) => send({ type: "tool_started", event }),
           onToolEvent: (event) => send({ type: "tool_event", event })
         });
         send({ type: "result", result });

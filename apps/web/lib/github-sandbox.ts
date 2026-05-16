@@ -2,6 +2,7 @@ import { runAgentTask, type ToolExecutor } from "@coding-agent/agent-core";
 import type {
   AgentProvider,
   AgentToolEvent,
+  AgentToolStartEvent,
   AgentRunResponse,
   CommandResult,
   CreateFileResult,
@@ -33,6 +34,7 @@ export type GitHubRepositoryTaskRequest = {
   provider: AgentProvider;
   model?: string;
   mode?: GitHubTaskMode;
+  onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
   onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
 };
 
@@ -78,6 +80,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt),
     executor,
     maxToolRounds: 12,
+    onToolStart: request.onToolStart,
     onToolEvent: request.onToolEvent
   });
 

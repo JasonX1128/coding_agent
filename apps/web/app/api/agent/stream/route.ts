@@ -33,6 +33,7 @@ export async function POST(request: Request) {
           model: body.model,
           prompt: body.prompt,
           executor,
+          onToolStart: (event) => send({ type: "tool_started", event }),
           onToolEvent: (event) => send({ type: "tool_event", event })
         });
         send({ type: "result", result });

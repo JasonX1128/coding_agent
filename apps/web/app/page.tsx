@@ -7,6 +7,7 @@ import {
   type AgentRunResponse,
   type AgentStreamEvent,
   type AgentToolEvent,
+  type AgentToolStartEvent,
   type Workspace
 } from "@coding-agent/shared";
 
@@ -54,6 +55,10 @@ type GitHubPullRequest = {
   updatedAt: string;
 };
 
+type LiveToolEvent = AgentToolStartEvent & {
+  result?: AgentToolEvent["result"];
+};
+
 export default function Home() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("local");
   const [daemonOrigin, setDaemonOrigin] = useState(DEFAULT_DAEMON_ORIGIN);
@@ -65,7 +70,7 @@ export default function Home() {
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("Inspect this repository and summarize what is implemented.");
   const [agentResult, setAgentResult] = useState<AgentRunResponse | null>(null);
-  const [localToolEvents, setLocalToolEvents] = useState<AgentToolEvent[]>([]);
+  const [localToolEvents, setLocalToolEvents] = useState<LiveToolEvent[]>([]);
   const [toolOutput, setToolOutput] = useState<ToolPayload | null>(null);
   const [selectedFile, setSelectedFile] = useState("DEVELOPMENT_AGENT_PLAN.md");
   const [searchQuery, setSearchQuery] = useState("agent");
@@ -76,7 +81,7 @@ export default function Home() {
   const [githubRepoFullName, setGithubRepoFullName] = useState("");
   const [githubPrompt, setGithubPrompt] = useState("Inspect this repository and summarize what it does.");
   const [githubResult, setGithubResult] = useState<GitHubTaskResult | null>(null);
-  const [githubToolEvents, setGithubToolEvents] = useState<AgentToolEvent[]>([]);
+  const [githubToolEvents, setGithubToolEvents] = useState<LiveToolEvent[]>([]);
   const [githubPullRequests, setGithubPullRequests] = useState<GitHubPullRequest[]>([]);
   const [githubPullMessage, setGithubPullMessage] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -173,8 +178,13 @@ export default function Home() {
           workspaceId
         })
       });
-      const data = await readAgentStream<AgentRunResponse>(response, (event) => {
-        setLocalToolEvents((current) => [...current, event]);
+      const data = await readAgentStream<AgentRunResponse>(response, {
+        onToolStart: (event) => {
+          setLocalToolEvents((current) => upsertLiveToolEvent(current, event));
+        },
+        onToolEvent: (event) => {
+          setLocalToolEvents((current) => upsertLiveToolEvent(current, event));
+        }
       });
       setAgentResult(data);
     } catch (caught) {
@@ -203,8 +213,13 @@ export default function Home() {
           mode: "auto"
         })
       });
-      const data = await readAgentStream<GitHubTaskResult>(response, (event) => {
-        setGithubToolEvents((current) => [...current, event]);
+      const data = await readAgentStream<GitHubTaskResult>(response, {
+        onToolStart: (event) => {
+          setGithubToolEvents((current) => upsertLiveToolEvent(current, event));
+        },
+        onToolEvent: (event) => {
+          setGithubToolEvents((current) => upsertLiveToolEvent(current, event));
+        }
       });
       setGithubResult(data);
     } catch (caught) {
@@ -629,7 +644,7 @@ function GithubAgentPanel({
   );
 }
 
-function ToolEvents({ events }: { events: AgentToolEvent[] }) {
+function ToolEvents({ events }: { events: LiveToolEvent[] }) {
   if (events.length === 0) {
     return <div className="muted">No tool events yet.</div>;
   }
@@ -639,9 +654,9 @@ function ToolEvents({ events }: { events: AgentToolEvent[] }) {
       {events.map((event) => (
         <div className="event" key={event.id}>
           <strong>
-            {event.name} · {event.result.status}
+            {event.name} · {event.result?.status || "running"}
           </strong>
-          <p>{event.result.summary}</p>
+          <p>{event.result?.summary || "Tool call requested."}</p>
         </div>
       ))}
     </div>
@@ -654,7 +669,10 @@ function errorMessage(error: unknown): string {
 
 async function readAgentStream<T extends AgentRunResponse>(
   response: Response,
-  onToolEvent: (event: AgentToolEvent) => void
+  handlers: {
+    onToolStart: (event: AgentToolStartEvent) => void;
+    onToolEvent: (event: AgentToolEvent) => void;
+  }
 ): Promise<T> {
   if (!response.body) throw new Error("Agent stream response did not include a body.");
   if (!response.ok) {
@@ -670,8 +688,12 @@ async function readAgentStream<T extends AgentRunResponse>(
   const handleLine = (line: string) => {
     if (!line.trim()) return;
     const event = JSON.parse(line) as AgentStreamEvent;
+    if (event.type === "tool_started") {
+      handlers.onToolStart(event.event);
+      return;
+    }
     if (event.type === "tool_event") {
-      onToolEvent(event.event);
+      handlers.onToolEvent(event.event);
       return;
     }
     if (event.type === "result") {
@@ -697,6 +719,14 @@ async function readAgentStream<T extends AgentRunResponse>(
 
   if (!finalResult) throw new Error("Agent stream ended without a final result.");
   return finalResult;
+}
+
+function upsertLiveToolEvent(events: LiveToolEvent[], event: LiveToolEvent): LiveToolEvent[] {
+  const index = events.findIndex((candidate) => candidate.id === event.id);
+  if (index === -1) return [...events, event];
+  return events.map((candidate, candidateIndex) => (
+    candidateIndex === index ? { ...candidate, ...event } : candidate
+  ));
 }
 
 function formatRelativeDate(value: string): string {

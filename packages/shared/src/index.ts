@@ -26,6 +26,12 @@ export type AgentToolEvent = {
   result: ToolResult;
 };
 
+export type AgentToolStartEvent = {
+  id: string;
+  name: string;
+  args: unknown;
+};
+
 export type AgentRunResponse = {
   provider: AgentProvider;
   model: string;
@@ -34,6 +40,7 @@ export type AgentRunResponse = {
 };
 
 export type AgentStreamEvent =
+  | { type: "tool_started"; event: AgentToolStartEvent }
   | { type: "tool_event"; event: AgentToolEvent }
   | { type: "result"; result: AgentRunResponse }
   | { type: "error"; error: string };
