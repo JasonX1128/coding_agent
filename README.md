@@ -58,7 +58,7 @@ GROQ_TASK_MODE_MODEL
 
 The Google adapter queries model candidates in strength order by default:
 `gemini-3-flash-preview`, `gemini-3.1-flash-lite`, `gemma-4-31b-it`,
-`gemini-2.5-flash`, then `gemini-2.5-flash-lite`. It falls through on model
+`gemma-4-26b-a4b-it`, `gemini-2.5-flash`, then `gemini-2.5-flash-lite`. It falls through on model
 availability, quota, rate-limit, and high-demand errors, including failures that
 happen after earlier tool calls in the same run. Override the full ordered pool
 with `GOOGLE_MODEL_CANDIDATES`, or append legacy fallbacks with `GOOGLE_MODEL`,
