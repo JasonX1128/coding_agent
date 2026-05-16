@@ -45,6 +45,7 @@ OPENAI_API_KEY
 ANTHROPIC_API_KEY
 GEMINI_API_KEY
 GOOGLE_MODEL
+GOOGLE_MODEL_CANDIDATES
 GOOGLE_BACKUP_MODEL
 GOOGLE_LAST_RESORT_MODEL
 GROQ_API_KEY
@@ -55,11 +56,13 @@ GOOGLE_TASK_MODE_MODEL
 GROQ_TASK_MODE_MODEL
 ```
 
-The Google adapter defaults to `gemini-3.1-flash-lite` and falls back to
-`gemma-4-31b-it` if the primary Google model request fails before any local tool
-side effects occur. It also keeps `gemini-2.5-flash-lite` as a final safety net
-because provider-side availability can differ by key and model version. Override
-those with `GOOGLE_MODEL`, `GOOGLE_BACKUP_MODEL`, and `GOOGLE_LAST_RESORT_MODEL`.
+The Google adapter queries model candidates in strength order by default:
+`gemini-3-flash-preview`, `gemini-3.1-flash-lite`, `gemma-4-31b-it`,
+`gemini-2.5-flash`, then `gemini-2.5-flash-lite`. It falls through on model
+availability, quota, rate-limit, and high-demand errors, including failures that
+happen after earlier tool calls in the same run. Override the full ordered pool
+with `GOOGLE_MODEL_CANDIDATES`, or append legacy fallbacks with `GOOGLE_MODEL`,
+`GOOGLE_BACKUP_MODEL`, and `GOOGLE_LAST_RESORT_MODEL`.
 
 When GitHub repository tasks run in `auto` mode, the app asks the selected model
 to classify the prompt as `read` or `write` with tools disabled. Set

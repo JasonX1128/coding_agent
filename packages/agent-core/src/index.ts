@@ -70,9 +70,35 @@ const instructions = [
   "- Do not retry the same malformed patch. Make the next attempt smaller and anchored to exact current file content.",
   "- After two patch failures on the same file, stop broad patching and make the smallest possible single-hunk edit."
 ].join("\n");
-const googleDefaultModel = "gemini-3.1-flash-lite";
-const googleDefaultBackupModel = "gemma-4-31b-it";
-const googleDefaultLastResortModel = "gemini-2.5-flash-lite";
+type GoogleContent = { role: "user" | "model"; parts: unknown[] };
+type GoogleModelFailure = { model: string; message: string };
+
+const googleDefaultModel = "gemini-3-flash-preview";
+const googleDefaultModelCandidates = [
+  "gemini-3-flash-preview",
+  "gemini-3.1-flash-lite",
+  "gemma-4-31b-it",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite"
+];
+const googleModelStrengthOrder = [
+  "gemini-3.1-pro-preview",
+  "gemini-3-pro-preview",
+  "gemini-pro-latest",
+  "gemini-3-flash-preview",
+  "gemini-flash-latest",
+  "gemini-3.1-flash-lite",
+  "gemini-3.1-flash-lite-preview",
+  "gemma-4-31b-it",
+  "gemma-4-26b-a4b-it",
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-001",
+  "gemini-2.0-flash-lite",
+  "gemini-2.0-flash-lite-001"
+];
 
 const daemonTools = [
   {
@@ -378,7 +404,7 @@ function createAnthropicMessagesAdapter(): AgentProviderAdapter {
 function createGoogleGeminiAdapter(): AgentProviderAdapter {
   return {
     provider: "google",
-    defaultModel: () => process.env.GOOGLE_MODEL || googleDefaultModel,
+    defaultModel: () => googleModelCandidates(process.env.GOOGLE_MODEL || googleDefaultModel)[0] || googleDefaultModel,
     async run({ request, model, toolEvents }) {
       const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
       if (!apiKey) {
@@ -386,46 +412,93 @@ function createGoogleGeminiAdapter(): AgentProviderAdapter {
       }
 
       const modelCandidates = googleModelCandidates(model);
-      let lastError: unknown;
-
-      for (const candidate of modelCandidates) {
-        const candidateToolEvents: AgentToolEvent[] = [];
-        try {
-          const result = await runGoogleGeminiModel({
-            apiKey,
-            request,
-            model: candidate,
-            toolEvents: candidateToolEvents
-          });
-          toolEvents.push(...candidateToolEvents);
-          return result;
-        } catch (error) {
-          if (!(error instanceof ProviderModelError)) throw error;
-          lastError = error;
-        }
-      }
-
-      throw lastError instanceof Error ? lastError : new Error("Google model request failed.");
+      return runGoogleGeminiModels({
+        apiKey,
+        request,
+        modelCandidates,
+        toolEvents
+      });
     }
   };
 }
 
-async function runGoogleGeminiModel({
+async function runGoogleGeminiModels({
   apiKey,
   request,
-  model,
+  modelCandidates,
   toolEvents
-}: ProviderRunContext & { apiKey: string }): Promise<AgentRunResponse> {
-  const contents: Array<{ role: "user" | "model"; parts: unknown[] }> = [
+}: {
+  apiKey: string;
+  request: AgentRunRequest;
+  modelCandidates: string[];
+  toolEvents: AgentToolEvent[];
+}): Promise<AgentRunResponse> {
+  const contents: GoogleContent[] = [
     { role: "user", parts: [{ text: request.prompt }] }
   ];
   let finalText = "";
+  let activeModel = modelCandidates[0] || googleDefaultModel;
+  let candidateIndex = 0;
+  const failures: GoogleModelFailure[] = [];
 
   for (let round = 0; round < (request.maxToolRounds ?? 8); round += 1) {
-    let data: Record<string, unknown>;
+    const response = await requestGoogleTurnWithFallback({
+      apiKey,
+      request,
+      contents,
+      modelCandidates,
+      startIndex: candidateIndex,
+      failures
+    });
+    activeModel = response.model;
+    candidateIndex = response.index;
+
+    const turn = parseGoogleGeminiTurn(response.data);
+    finalText = turn.text || finalText;
+
+    const modelContent = getGoogleModelContent(response.data);
+    if (modelContent) contents.push(modelContent);
+
+    if (turn.toolCalls.length === 0) break;
+
+    const resultParts = [];
+    for (const call of turn.toolCalls) {
+      const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent);
+      resultParts.push({
+        functionResponse: {
+          name: call.name,
+          id: call.id,
+          response: { result }
+        }
+      });
+    }
+    contents.push({ role: "user", parts: resultParts });
+  }
+
+  return providerResponse("google", activeModel, finalText, toolEvents);
+}
+
+async function requestGoogleTurnWithFallback({
+  apiKey,
+  request,
+  contents,
+  modelCandidates,
+  startIndex,
+  failures
+}: {
+  apiKey: string;
+  request: AgentRunRequest;
+  contents: GoogleContent[];
+  modelCandidates: string[];
+  startIndex: number;
+  failures: GoogleModelFailure[];
+}): Promise<{ data: Record<string, unknown>; model: string; index: number }> {
+  for (let index = startIndex; index < modelCandidates.length; index += 1) {
+    const candidate = modelCandidates[index];
+    if (!candidate) continue;
     try {
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${googleModelPath(model)}:generateContent`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${googleModelPath(candidate)}:generateContent`,
         {
           method: "POST",
           headers: {
@@ -445,36 +518,22 @@ async function runGoogleGeminiModel({
           })
         }
       );
-      data = await readJsonResponse(response);
+      return {
+        data: await readJsonResponse(response),
+        model: candidate,
+        index
+      };
     } catch (error) {
-      const message = `Google model "${model}" request failed: ${errorMessage(error)}`;
-      if (toolEvents.length > 0) throw new Error(message);
-      throw new ProviderModelError(message);
+      const message = `Google model "${candidate}" request failed: ${errorMessage(error)}`;
+      failures.push({ model: candidate, message });
+      if (!shouldTryNextGoogleModel(error)) throw new Error(message);
     }
-
-    const turn = parseGoogleGeminiTurn(data);
-    finalText = turn.text || finalText;
-
-    const modelContent = getGoogleModelContent(data);
-    if (modelContent) contents.push(modelContent);
-
-    if (turn.toolCalls.length === 0) break;
-
-    const resultParts = [];
-    for (const call of turn.toolCalls) {
-      const result = await executeToolCall(request.executor, call, toolEvents, request.onToolStart, request.onToolEvent);
-      resultParts.push({
-        functionResponse: {
-          name: call.name,
-          id: call.id,
-          response: { result }
-        }
-      });
-    }
-    contents.push({ role: "user", parts: resultParts });
   }
 
-  return providerResponse("google", model, finalText, toolEvents);
+  throw new Error([
+    "All configured Google model candidates failed.",
+    ...failures.map((failure) => `- ${failure.message}`)
+  ].join("\n"));
 }
 
 function createGroqChatCompletionsAdapter(): AgentProviderAdapter {
@@ -842,13 +901,57 @@ function googleSchemaType(value: string): string {
 }
 
 function googleModelCandidates(primaryModel: string): string[] {
-  const backupModel = process.env.GOOGLE_BACKUP_MODEL || googleDefaultBackupModel;
-  const lastResortModel = process.env.GOOGLE_LAST_RESORT_MODEL || googleDefaultLastResortModel;
-  return [...new Set([primaryModel, backupModel, lastResortModel].filter(Boolean))];
+  const configuredCandidates = parseModelList(process.env.GOOGLE_MODEL_CANDIDATES);
+  const candidates = configuredCandidates.length > 0
+    ? configuredCandidates
+    : [
+      primaryModel,
+      process.env.GOOGLE_MODEL,
+      process.env.GOOGLE_BACKUP_MODEL,
+      process.env.GOOGLE_LAST_RESORT_MODEL,
+      ...googleDefaultModelCandidates
+    ];
+
+  return [...new Set(candidates
+    .filter((model): model is string => Boolean(model))
+    .map((model) => model.replace(/^models\//, "")))]
+    .sort((left, right) => googleModelStrength(left) - googleModelStrength(right));
+}
+
+function parseModelList(value?: string): string[] {
+  return (value || "")
+    .split(",")
+    .map((model) => model.trim())
+    .filter(Boolean);
+}
+
+function googleModelStrength(model: string): number {
+  const normalized = model.replace(/^models\//, "");
+  const index = googleModelStrengthOrder.indexOf(normalized);
+  return index === -1 ? googleModelStrengthOrder.length : index;
 }
 
 function googleModelPath(model: string): string {
   return encodeURIComponent(model.replace(/^models\//, ""));
+}
+
+function shouldTryNextGoogleModel(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return [
+    "high demand",
+    "try again later",
+    "temporarily unavailable",
+    "unavailable",
+    "overloaded",
+    "resource exhausted",
+    "quota",
+    "rate limit",
+    "429",
+    "503",
+    "not found",
+    "not supported",
+    "permission"
+  ].some((pattern) => message.includes(pattern));
 }
 
 function errorMessage(error: unknown): string {
@@ -860,11 +963,4 @@ function extractErrorMessage(data: Record<string, unknown>): string | undefined 
   if (!error || typeof error !== "object") return undefined;
   const message = (error as Record<string, unknown>).message;
   return typeof message === "string" ? message : undefined;
-}
-
-class ProviderModelError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ProviderModelError";
-  }
 }
