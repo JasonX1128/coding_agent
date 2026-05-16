@@ -14,6 +14,7 @@ import {
   type ValidationCheck,
   type Workspace
 } from "@coding-agent/shared";
+import { loadChats as loadStoredChats, saveChats as saveStoredChats, type ChatSession, type ChatMessage, type ChatLiveToolEvent } from "../lib/chat";
 
 type DaemonStatus = "unknown" | "online" | "offline";
 type ActiveTab = "local" | "github";
@@ -65,11 +66,6 @@ type GitHubPullRequest = {
   updatedAt: string;
 };
 
-type LiveToolEvent = AgentToolStartEvent & {
-  result?: AgentToolEvent["result"];
-  finishedAt?: number;
-  durationMs?: number;
-};
 
 type RunTimer = {
   startedAt: number;
@@ -85,6 +81,9 @@ type ActivityEntry = {
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("local");
+  const [chatInput, setChatInput] = useState("");
+  const [chats, setChats] = useState<ChatSession[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [daemonOrigin, setDaemonOrigin] = useState(DEFAULT_DAEMON_ORIGIN);
   const [daemonStatus, setDaemonStatus] = useState<DaemonStatus>("unknown");
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -94,7 +93,7 @@ export default function Home() {
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("Inspect this repository and summarize what is implemented.");
   const [agentResult, setAgentResult] = useState<AgentRunResponse | null>(null);
-  const [localToolEvents, setLocalToolEvents] = useState<LiveToolEvent[]>([]);
+  const [localToolEvents, setLocalToolEvents] = useState<ChatLiveToolEvent[]>([]);
   const [localRunTimer, setLocalRunTimer] = useState<RunTimer | null>(null);
   const [localActivity, setLocalActivity] = useState<ActivityEntry[]>([]);
   const [toolOutput, setToolOutput] = useState<ToolPayload | null>(null);
@@ -108,7 +107,7 @@ export default function Home() {
   const [githubPrompt, setGithubPrompt] = useState("Inspect this repository and summarize what it does.");
   const [githubAutopilot, setGithubAutopilot] = useState(false);
   const [githubResult, setGithubResult] = useState<GitHubTaskResult | null>(null);
-  const [githubToolEvents, setGithubToolEvents] = useState<LiveToolEvent[]>([]);
+  const [githubToolEvents, setGithubToolEvents] = useState<ChatLiveToolEvent[]>([]);
   const [githubRunTimer, setGithubRunTimer] = useState<RunTimer | null>(null);
   const [githubActivity, setGithubActivity] = useState<ActivityEntry[]>([]);
   const [githubPullRequests, setGithubPullRequests] = useState<GitHubPullRequest[]>([]);
@@ -131,6 +130,14 @@ export default function Home() {
     const interval = window.setInterval(() => setClockNow(Date.now()), 200);
     return () => window.clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    setChats(loadStoredChats());
+  }, []);
+
+  useEffect(() => {
+    saveStoredChats(chats);
+  }, [chats]);
 
   async function connectDaemon() {
     setBusy("daemon");
@@ -155,6 +162,18 @@ export default function Home() {
     }
   }
 
+  function createNewChat() {
+    const newChat: ChatSession = {
+      id: crypto.randomUUID(),
+      title: "New Chat",
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    setChats([newChat, ...chats]);
+    setActiveChatId(newChat.id);
+  }
+
   async function addWorkspace() {
     setBusy("workspace");
     setError(null);
@@ -173,6 +192,56 @@ export default function Home() {
       setError(errorMessage(caught));
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function sendChatMessage(input: string) {
+    if (!activeChatId) return;
+    const chat = chats.find(c => c.id === activeChatId);
+    if (!chat) return;
+
+    const userMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      prompt: input,
+      createdAt: Date.now(),
+    };
+
+    let updatedChat = { ...chat, messages: [...chat.messages, userMessage], updatedAt: Date.now() };
+    setChats(chats.map(c => c.id === activeChatId ? updatedChat : c));
+    setChatInput("");
+
+    try {
+      const response = await fetch("/api/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: input,
+          daemonOrigin,
+          workspaceId: workspaceId || "default"
+        })
+      });
+
+      const data = await response.json();
+      
+      const assistantMessage: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        result: data,
+        createdAt: Date.now(),
+      };
+
+      updatedChat = { 
+        ...updatedChat, 
+        messages: [...updatedChat.messages, assistantMessage], 
+        updatedAt: Date.now(),
+        title: chat.messages.length === 0 ? input.substring(0, 30) : chat.title
+      };
+      setChats(chats.map(c => c.id === activeChatId ? updatedChat : c));
+
+    } catch (err) {
+      console.error("Agent error:", err);
+      // Handle error in UI
     }
   }
 
@@ -614,6 +683,12 @@ export default function Home() {
 
           <section className="stack">
             <h2>Workspace Tools</h2>
+            <button onClick={createNewChat}>New Chat</button>
+            {chats.map((chat) => (
+              <button key={chat.id} className={activeChatId === chat.id ? "active" : ""} onClick={() => setActiveChatId(chat.id)}>
+                {chat.title}
+              </button>
+            ))}
             <button onClick={() => callDaemonTool("list_files", { path: ".", maxFiles: 160 })}>
               List files
             </button>
@@ -684,9 +759,21 @@ export default function Home() {
 
           <div className="stack">
             <section className="panel stack">
-              <h2>Direct Tool Output</h2>
-              {error ? <div className="error">{error}</div> : null}
-              <pre>{toolOutput ? JSON.stringify(toolOutput, null, 2) : "No direct tool output yet."}</pre>
+              <h2>Chat</h2>
+              <div className="row">
+                <input value={chatInput} onChange={(e) => setChatInput(e.target.value)} placeholder="Type a message..." />
+                <button onClick={() => { sendChatMessage(chatInput); }}>Send</button>
+              </div>
+            </section>
+
+            <section className="panel stack">
+              <h2>Chat History</h2>
+              {activeChatId && chats.find(c => c.id === activeChatId)?.messages.map(msg => (
+                <div key={msg.id} className={`message ${msg.role}`}>
+                  {msg.prompt && <div className="prompt">{msg.prompt}</div>}
+                  {msg.result && <pre className="result">{JSON.stringify(msg.result, null, 2)}</pre>}
+                </div>
+              ))}
             </section>
 
             <section className="panel stack">
@@ -1056,7 +1143,7 @@ function qualityStatusClass(review?: AgentReviewResult): string {
   return "unknown";
 }
 
-function ToolEvents({ events, now }: { events: LiveToolEvent[]; now: number }) {
+function ToolEvents({ events, now }: { events: ChatLiveToolEvent[]; now: number }) {
   if (events.length === 0) {
     return <div className="muted">No tool events yet.</div>;
   }
@@ -1209,7 +1296,7 @@ async function readAgentStream<T extends AgentRunResponse>(
   return finalResult;
 }
 
-function upsertLiveToolEvent(events: LiveToolEvent[], event: LiveToolEvent): LiveToolEvent[] {
+function upsertLiveToolEvent(events: ChatLiveToolEvent[], event: ChatLiveToolEvent): ChatLiveToolEvent[] {
   const index = events.findIndex((candidate) => candidate.id === event.id);
   if (index === -1) return [...events, event];
   return events.map((candidate, candidateIndex) => (
