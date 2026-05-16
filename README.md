@@ -148,6 +148,12 @@ Paused runs keep their sandbox and diff, then the web UI offers **Continue**,
 **Open Draft PR**, **Stop Without PR**, and **Discard Sandbox**. Set
 `GITHUB_WRITE_MAX_TOOL_ROUNDS` to change the checkpoint size.
 
+Coding prompts use a structured delivery loop: derive an implementation plan and
+acceptance criteria, inspect the owning files, implement against those criteria,
+inspect the diff, run relevant validation, and summarize which criteria were
+satisfied. Passing typecheck alone is not treated as proof that a broad feature
+request is complete.
+
 The GitHub tab can also refresh open agent pull requests for the selected
 repository. It only shows PRs that look agent-created, such as `agent/*` branches
 or `Agent:` titles. From the web UI you can approve or close one of those PRs
