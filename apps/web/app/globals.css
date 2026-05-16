@@ -480,6 +480,23 @@ pre {
   justify-content: flex-end;
 }
 
+.pause-box {
+  border: 1px solid #facc15;
+  border-radius: 6px;
+  background: #fffbeb;
+  padding: 10px;
+}
+
+.pause-box p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.pause-box pre {
+  max-height: 180px;
+}
+
 .chat-output {
   min-height: 140px;
 }

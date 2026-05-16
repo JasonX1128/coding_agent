@@ -38,6 +38,10 @@ type GitHubTaskResult = AgentRunResponse & {
   pullRequestNumber?: number;
   changedFiles?: string[];
   sandboxRoot?: string;
+  pauseId?: string;
+  pauseReason?: AgentRunResponse["stopReason"];
+  resumeAvailable?: boolean;
+  diffSummary?: string;
 };
 
 type GitHubPullRequest = {
@@ -306,6 +310,91 @@ export default function Home() {
     }
   }
 
+  async function resumeGithubAgent() {
+    const pauseId = githubResult?.pauseId;
+    if (!pauseId) return;
+    const startedAt = Date.now();
+    setBusy("github-agent-resume");
+    setError(null);
+    setGithubResult(null);
+    setGithubRunTimer({ startedAt });
+    setGithubActivity((current) => [
+      ...current,
+      createActivityEntry(`Continuing paused GitHub run ${pauseId}.`, "running", startedAt)
+    ]);
+    try {
+      const response = await fetch("/api/github/tasks/resume/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pauseId })
+      });
+      const data = await readAgentStream<GitHubTaskResult>(response, {
+        onToolStart: (event) => {
+          setGithubToolEvents((current) => upsertLiveToolEvent(current, event));
+          setGithubActivity((current) => [
+            ...current,
+            createActivityEntry(describeToolStart(event), "running", event.startedAt, `${event.id}:start`)
+          ]);
+        },
+        onToolEvent: (event) => {
+          setGithubToolEvents((current) => upsertLiveToolEvent(current, event));
+          setGithubActivity((current) => [
+            ...current,
+            createActivityEntry(describeToolFinish(event), activityToneForTool(event), event.finishedAt, `${event.id}:finish`)
+          ]);
+        }
+      });
+      setGithubResult(data);
+      setGithubActivity((current) => [
+        ...current,
+        createActivityEntry(describeGitHubRunFinish(startedAt, Date.now(), data), data.status === "paused" ? "info" : "done")
+      ]);
+    } catch (caught) {
+      setGithubActivity((current) => [
+        ...current,
+        createActivityEntry(`Resume stopped with an error: ${errorMessage(caught)}`, "error")
+      ]);
+      setError(errorMessage(caught));
+    } finally {
+      setGithubRunTimer((current) => current && current.startedAt === startedAt
+        ? { ...current, finishedAt: Date.now() }
+        : current);
+      setBusy(null);
+    }
+  }
+
+  async function actOnPausedGithubRun(action: "open_draft_pr" | "stop" | "discard") {
+    if (!githubResult?.pauseId) return;
+    const labels = {
+      open_draft_pr: "open a draft pull request",
+      stop: "stop without opening a pull request",
+      discard: "discard the sandbox"
+    };
+    const confirmed = window.confirm(`Confirm that you want to ${labels[action]}.`);
+    if (!confirmed) return;
+
+    setBusy(`github-paused-${action}`);
+    setError(null);
+    try {
+      const response = await fetch("/api/github/tasks/paused/actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pauseId: githubResult.pauseId, action })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error || "Could not update paused run.");
+      setGithubResult(data);
+      setGithubActivity((current) => [
+        ...current,
+        createActivityEntry(data.text || `Paused run action completed: ${action}.`, "done")
+      ]);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function selectGithubRepo(fullName: string) {
     setGithubRepoFullName(fullName);
     setGithubPullRequests([]);
@@ -513,6 +602,8 @@ export default function Home() {
                 loadGithubPullRequests={loadGithubPullRequests}
                 updateGithubPullRequest={updateGithubPullRequest}
                 runGithubAgent={runGithubAgent}
+                resumeGithubAgent={resumeGithubAgent}
+                actOnPausedGithubRun={actOnPausedGithubRun}
                 busy={busy}
                 githubResult={githubResult}
                 githubPullRequests={githubPullRequests}
@@ -630,6 +721,8 @@ function GithubAgentPanel({
   loadGithubPullRequests,
   updateGithubPullRequest,
   runGithubAgent,
+  resumeGithubAgent,
+  actOnPausedGithubRun,
   busy,
   githubResult,
   githubPullRequests,
@@ -647,6 +740,8 @@ function GithubAgentPanel({
   loadGithubPullRequests: () => void;
   updateGithubPullRequest: (number: number, action: "approve" | "close") => void;
   runGithubAgent: () => void;
+  resumeGithubAgent: () => void;
+  actOnPausedGithubRun: (action: "open_draft_pr" | "stop" | "discard") => void;
   busy: string | null;
   githubResult: GitHubTaskResult | null;
   githubPullRequests: GitHubPullRequest[];
@@ -683,6 +778,43 @@ function GithubAgentPanel({
       <button className="primary" disabled={busy === "github-agent" || !githubRepoFullName || !githubPrompt.trim()} onClick={runGithubAgent}>
         Run Agent
       </button>
+      {githubResult?.status === "paused" && githubResult.pauseId ? (
+        <div className="pause-box stack">
+          <div>
+            <strong>Paused for confirmation</strong>
+            <p>{pauseReasonText(githubResult.pauseReason)}</p>
+          </div>
+          {githubResult.diffSummary ? <pre>{githubResult.diffSummary}</pre> : null}
+          <div className="row">
+            <button
+              className="primary"
+              disabled={busy === "github-agent-resume"}
+              onClick={resumeGithubAgent}
+            >
+              Continue
+            </button>
+            <button
+              disabled={busy === "github-paused-open_draft_pr"}
+              onClick={() => actOnPausedGithubRun("open_draft_pr")}
+            >
+              Open Draft PR
+            </button>
+            <button
+              disabled={busy === "github-paused-stop"}
+              onClick={() => actOnPausedGithubRun("stop")}
+            >
+              Stop Without PR
+            </button>
+            <button
+              className="danger"
+              disabled={busy === "github-paused-discard"}
+              onClick={() => actOnPausedGithubRun("discard")}
+            >
+              Discard Sandbox
+            </button>
+          </div>
+        </div>
+      ) : null}
       <div className="statusline">
         {githubResult?.pullRequestUrl ? (
           <a href={githubResult.pullRequestUrl} target="_blank" rel="noreferrer">
@@ -949,9 +1081,17 @@ function describeRunFinish(startedAt: number, finishedAt: number, toolEvents: Ag
 
 function describeGitHubRunFinish(startedAt: number, finishedAt: number, result: GitHubTaskResult): string {
   const base = describeRunFinish(startedAt, finishedAt, result.toolEvents);
+  if (result.status === "paused") return `${base} Paused for confirmation: ${pauseReasonText(result.pauseReason)}`;
   if (result.pullRequestUrl) return `${base} Opened pull request #${result.pullRequestNumber}.`;
   if (result.mode === "write") return `${base} Write-mode run completed without opening a pull request.`;
   return `${base} Read-only repository response completed.`;
+}
+
+function pauseReasonText(reason?: AgentRunResponse["stopReason"]): string {
+  if (reason === "max_tool_rounds") return "The run reached the tool-round checkpoint.";
+  if (reason === "validation_failed") return "Validation failed after file changes.";
+  if (reason === "provider_error") return "The model provider failed after partial progress.";
+  return "The run needs a human decision before continuing.";
 }
 
 function describeActivitySummary(entries: ActivityEntry[], timer: RunTimer | null, now: number): string {

@@ -16,8 +16,9 @@ import type {
   ToolResult
 } from "@coding-agent/shared";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
   createInstallationToken,
@@ -47,6 +48,32 @@ export type GitHubRepositoryTaskResult = AgentRunResponse & {
   pullRequestNumber?: number;
   changedFiles: string[];
   sandboxRoot: string;
+  pauseId?: string;
+  pauseReason?: AgentRunResponse["stopReason"];
+  resumeAvailable?: boolean;
+  diffSummary?: string;
+};
+
+export type PausedGitHubRunAction = "open_draft_pr" | "stop" | "discard";
+
+type PausedGitHubRunRecord = {
+  id: string;
+  installationId: number;
+  repoFullName: string;
+  defaultBranch: string;
+  branchName: string;
+  sandboxRoot: string;
+  prompt: string;
+  provider: AgentProvider;
+  model?: string;
+  mode: ResolvedGitHubTaskMode;
+  createdAt: string;
+  updatedAt: string;
+  pauseReason: NonNullable<AgentRunResponse["stopReason"]>;
+  toolEvents: AgentToolEvent[];
+  resultText: string;
+  changedFiles: string[];
+  diffSummary: string;
 };
 
 const skippedDirectories = new Set([".git", "node_modules", ".next", "dist", "coverage", ".turbo"]);
@@ -88,7 +115,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
       model: request.model,
       prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt),
       executor,
-      maxToolRounds: mode === "write" ? 18 : 12,
+      maxToolRounds: mode === "write" ? githubWriteMaxToolRounds() : 12,
       onToolStart: request.onToolStart,
       onToolEvent: async (event) => {
         collectedToolEvents.push(event);
@@ -101,6 +128,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
 
   const changedFiles = await changedFileNames(rootPath);
   const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
+  const pauseReason = mode === "write" ? pauseReasonForResult(result) : undefined;
   if (mode === "read") {
     return {
       ...result,
@@ -109,6 +137,25 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
       changedFiles: [],
       sandboxRoot
     };
+  }
+
+  if (!branchName) throw new Error("Write-mode GitHub task did not create a working branch.");
+
+  if (pauseReason) {
+    return pauseGitHubRun({
+      installationId: repo.installationId,
+      repoFullName: repo.fullName,
+      defaultBranch: repo.defaultBranch,
+      branchName,
+      sandboxRoot: rootPath,
+      prompt: request.prompt,
+      provider: request.provider,
+      model: request.model,
+      mode,
+      pauseReason,
+      result,
+      changedFiles: committableFiles
+    });
   }
 
   if (committableFiles.length === 0) {
@@ -123,36 +170,303 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     };
   }
 
-  if (!branchName) throw new Error("Write-mode GitHub task did not create a working branch.");
+  return finalizeGitHubRun({
+    installationId: repo.installationId,
+    repoFullName: repo.fullName,
+    defaultBranch: repo.defaultBranch,
+    installationToken: installationToken.token,
+    branchName,
+    rootPath,
+    prompt: request.prompt,
+    result,
+    changedFiles: committableFiles,
+    mode,
+    draft: false
+  });
+}
 
-  await runRequired("git", ["add", "-A", "--", ...committableFiles], rootPath, 20_000);
-  await runRequired("git", ["commit", "-m", commitTitle(request.prompt)], rootPath, 60_000);
+export async function resumeGitHubRepositoryTask({
+  pauseId,
+  continuation,
+  onToolStart,
+  onToolEvent
+}: {
+  pauseId: string;
+  continuation?: string;
+  onToolStart?: (event: AgentToolStartEvent) => void | Promise<void>;
+  onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
+}): Promise<GitHubRepositoryTaskResult> {
+  const record = await readPausedRun(pauseId);
+  const rootPath = await realpath(record.sandboxRoot);
+  const installationToken = await createInstallationToken(record.installationId);
+  const executor = createWritableSandboxExecutor(rootPath);
+  const collectedToolEvents: AgentToolEvent[] = [...record.toolEvents];
+  let result: AgentRunResponse;
+
+  try {
+    result = await runAgentTask({
+      provider: record.provider,
+      model: record.model,
+      prompt: await buildResumePrompt(record, rootPath, continuation),
+      executor,
+      maxToolRounds: githubWriteMaxToolRounds(),
+      onToolStart,
+      onToolEvent: async (event) => {
+        collectedToolEvents.push(event);
+        await onToolEvent?.(event);
+      }
+    });
+  } catch (error) {
+    result = recoverAgentRunResponse(record.provider, record.model, collectedToolEvents, error);
+  }
+
+  const changedFiles = await changedFileNames(rootPath);
+  const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
+  if (committableFiles.length === 0) {
+    await deletePausedRun(record.id, false);
+    return {
+      ...result,
+      repository: record.repoFullName,
+      mode: record.mode,
+      branchName: record.branchName,
+      changedFiles: [],
+      sandboxRoot: rootPath,
+      text: `${result.text}\n\nNo non-empty file changes remain, so the paused run was closed without opening a pull request.`
+    };
+  }
+
+  const pauseReason = pauseReasonForResult(result);
+  if (pauseReason) {
+    return pauseGitHubRun({
+      installationId: record.installationId,
+      repoFullName: record.repoFullName,
+      defaultBranch: record.defaultBranch,
+      branchName: record.branchName,
+      sandboxRoot: rootPath,
+      prompt: record.prompt,
+      provider: record.provider,
+      model: record.model,
+      mode: record.mode,
+      pauseReason,
+      result: { ...result, toolEvents: collectedToolEvents },
+      changedFiles: committableFiles,
+      pauseId: record.id
+    });
+  }
+
+  const finalized = await finalizeGitHubRun({
+    installationId: record.installationId,
+    repoFullName: record.repoFullName,
+    defaultBranch: record.defaultBranch,
+    installationToken: installationToken.token,
+    branchName: record.branchName,
+    rootPath,
+    prompt: record.prompt,
+    result: { ...result, toolEvents: collectedToolEvents },
+    changedFiles: committableFiles,
+    mode: record.mode,
+    draft: false
+  });
+  await deletePausedRun(record.id, false);
+  return finalized;
+}
+
+export async function actOnPausedGitHubRun({
+  pauseId,
+  action
+}: {
+  pauseId: string;
+  action: PausedGitHubRunAction;
+}): Promise<GitHubRepositoryTaskResult> {
+  const record = await readPausedRun(pauseId);
+
+  if (action === "discard") {
+    await deletePausedRun(record.id, true);
+    return pausedActionResult(record, "Discarded the paused sandbox without opening a pull request.");
+  }
+
+  if (action === "stop") {
+    await deletePausedRun(record.id, false);
+    return pausedActionResult(record, "Stopped the paused run without opening a pull request. The sandbox was left on disk for inspection.");
+  }
+
+  const rootPath = await realpath(record.sandboxRoot);
+  const installationToken = await createInstallationToken(record.installationId);
+  const changedFiles = await committableChangedFileNames(rootPath, await changedFileNames(rootPath));
+  if (changedFiles.length === 0) {
+    await deletePausedRun(record.id, false);
+    return pausedActionResult(record, "No non-empty file changes remain, so no draft pull request was opened.");
+  }
+
+  const finalized = await finalizeGitHubRun({
+    installationId: record.installationId,
+    repoFullName: record.repoFullName,
+    defaultBranch: record.defaultBranch,
+    installationToken: installationToken.token,
+    branchName: record.branchName,
+    rootPath,
+    prompt: record.prompt,
+    result: {
+      provider: record.provider,
+      model: record.model || "provider-default",
+      text: `${record.resultText}\n\nOpened as a draft from a paused run. Pause reason: ${record.pauseReason}.`,
+      toolEvents: record.toolEvents,
+      status: "paused",
+      stopReason: record.pauseReason
+    },
+    changedFiles,
+    mode: record.mode,
+    draft: true
+  });
+  await deletePausedRun(record.id, false);
+  return finalized;
+}
+
+async function finalizeGitHubRun({
+  installationId,
+  repoFullName,
+  defaultBranch,
+  installationToken,
+  branchName,
+  rootPath,
+  prompt,
+  result,
+  changedFiles,
+  mode,
+  draft
+}: {
+  installationId: number;
+  repoFullName: string;
+  defaultBranch: string;
+  installationToken: string;
+  branchName: string;
+  rootPath: string;
+  prompt: string;
+  result: AgentRunResponse;
+  changedFiles: string[];
+  mode: ResolvedGitHubTaskMode;
+  draft: boolean;
+}): Promise<GitHubRepositoryTaskResult> {
+  await runRequired("git", ["add", "-A", "--", ...changedFiles], rootPath, 20_000);
+  await runRequired("git", ["commit", "-m", commitTitle(prompt)], rootPath, 60_000);
   await runRequired(
     "git",
-    ["push", tokenizedCloneUrl(repo.fullName, installationToken.token), `HEAD:${branchName}`],
+    ["push", tokenizedCloneUrl(repoFullName, installationToken), `HEAD:${branchName}`],
     rootPath,
     120_000,
-    installationToken.token
+    installationToken
   );
 
   const pullRequest = await openPullRequest({
-    installationId: repo.installationId,
-    repoFullName: repo.fullName,
-    title: prTitle(request.prompt),
-    body: prBody(request.prompt, result, committableFiles),
+    installationId,
+    repoFullName,
+    title: prTitle(prompt),
+    body: prBody(prompt, result, changedFiles),
     head: branchName,
-    base: repo.defaultBranch
+    base: defaultBranch,
+    draft
   });
 
   return {
     ...result,
-    repository: repo.fullName,
+    repository: repoFullName,
     mode,
     branchName,
     pullRequestUrl: pullRequest.htmlUrl,
     pullRequestNumber: pullRequest.number,
-    changedFiles: committableFiles,
-    sandboxRoot
+    changedFiles,
+    sandboxRoot: rootPath,
+    status: draft ? "completed" : result.status
+  };
+}
+
+async function pauseGitHubRun({
+  installationId,
+  repoFullName,
+  defaultBranch,
+  branchName,
+  sandboxRoot,
+  prompt,
+  provider,
+  model,
+  mode,
+  pauseReason,
+  result,
+  changedFiles,
+  pauseId
+}: {
+  installationId: number;
+  repoFullName: string;
+  defaultBranch: string;
+  branchName: string;
+  sandboxRoot: string;
+  prompt: string;
+  provider: AgentProvider;
+  model?: string;
+  mode: ResolvedGitHubTaskMode;
+  pauseReason: NonNullable<AgentRunResponse["stopReason"]>;
+  result: AgentRunResponse;
+  changedFiles: string[];
+  pauseId?: string;
+}): Promise<GitHubRepositoryTaskResult> {
+  const id = pauseId || randomUUID();
+  const diffSummary = await gitDiffSummary(sandboxRoot);
+  const record: PausedGitHubRunRecord = {
+    id,
+    installationId,
+    repoFullName,
+    defaultBranch,
+    branchName,
+    sandboxRoot,
+    prompt,
+    provider,
+    model,
+    mode,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    pauseReason,
+    toolEvents: result.toolEvents,
+    resultText: result.text,
+    changedFiles,
+    diffSummary
+  };
+  await writePausedRun(record);
+
+  return {
+    ...result,
+    repository: repoFullName,
+    mode,
+    branchName,
+    changedFiles,
+    sandboxRoot,
+    pauseId: id,
+    pauseReason,
+    resumeAvailable: true,
+    diffSummary,
+    status: "paused",
+    stopReason: pauseReason,
+    text: [
+      result.text,
+      "",
+      `Paused for confirmation: ${pauseReasonLabel(pauseReason)}.`,
+      `Changed files: ${changedFiles.length > 0 ? changedFiles.join(", ") : "none"}.`,
+      "Choose Continue, Open Draft PR, Stop Without PR, or Discard Sandbox from the web UI."
+    ].join("\n")
+  };
+}
+
+function pausedActionResult(record: PausedGitHubRunRecord, message: string): GitHubRepositoryTaskResult {
+  return {
+    provider: record.provider,
+    model: record.model || "provider-default",
+    text: message,
+    toolEvents: record.toolEvents,
+    status: "completed",
+    repository: record.repoFullName,
+    mode: record.mode,
+    branchName: record.branchName,
+    changedFiles: record.changedFiles,
+    sandboxRoot: record.sandboxRoot
   };
 }
 
@@ -339,7 +653,7 @@ async function runCommandTool(rootPath: string, args: Record<string, unknown>): 
 }
 
 async function createSandboxRoot(): Promise<string> {
-  const base = process.env.AGENT_SANDBOX_ROOT || path.resolve(repoRoot(), ".agent-sandboxes");
+  const base = agentSandboxBase();
   await mkdir(base, { recursive: true });
   return mkdtemp(path.join(base, "github-pr-"));
 }
@@ -674,6 +988,133 @@ function fallbackGitHubTaskMode(prompt: string): ResolvedGitHubTaskMode {
   return "read";
 }
 
+function pauseReasonForResult(result: AgentRunResponse): AgentRunResponse["stopReason"] | undefined {
+  if (result.stopReason === "max_tool_rounds" || result.stopReason === "provider_error") return result.stopReason;
+  if (hasFailedValidation(result.toolEvents)) return "validation_failed";
+  return undefined;
+}
+
+function hasFailedValidation(toolEvents: AgentToolEvent[]): boolean {
+  const latestValidation = [...toolEvents].reverse().find((event) => {
+    if (event.name !== "run_command") return false;
+    const command = asRecord(event.args).command;
+    return typeof command === "string" && /\b(typecheck|lint|test|build|check)\b/i.test(command);
+  });
+  return latestValidation?.result.status === "failed";
+}
+
+async function buildResumePrompt(record: PausedGitHubRunRecord, rootPath: string, continuation?: string): Promise<string> {
+  const status = await runProcess("git", ["status", "--short"], rootPath, 20_000);
+  const diff = await runProcess("git", ["diff", "--", "."], rootPath, 20_000);
+  const recentFailures = record.toolEvents
+    .filter((event) => event.result.status !== "completed")
+    .slice(-6)
+    .map((event) => `- ${event.name}: ${event.result.summary}${compactCommandOutput(event)}`)
+    .join("\n") || "- No failed tool calls were recorded before the pause.";
+
+  return [
+    `Repository: ${record.repoFullName}`,
+    `Base branch: ${record.defaultBranch}`,
+    `Working branch: ${record.branchName}`,
+    "",
+    "Continue the paused GitHub repository task in the existing sandbox.",
+    "Do not restart the task from scratch. Preserve the user's intent and the useful edits already made.",
+    "Use the current diff and recent failed tool output as feedback. Read files again when exact context is needed.",
+    "If validation failed, fix the compiler or test errors before opening a pull request.",
+    "If you reach a checkpoint again, leave the workspace in the best possible state for another continuation.",
+    "",
+    `Original user request: ${record.prompt}`,
+    continuation?.trim() ? `User continuation instruction: ${continuation.trim()}` : "",
+    "",
+    `Pause reason: ${pauseReasonLabel(record.pauseReason)}`,
+    "",
+    "Recent failed or blocked tool feedback:",
+    recentFailures,
+    "",
+    "Current git status:",
+    status.stdout.trim() || "(clean)",
+    "",
+    "Current diff:",
+    truncateMiddle(diff.stdout.trim() || "(no diff)", 28_000)
+  ].filter(Boolean).join("\n");
+}
+
+function compactCommandOutput(event: AgentToolEvent): string {
+  const data = asRecord(event.result.data);
+  const stdout = typeof data.stdout === "string" && data.stdout.trim()
+    ? `\n  stdout: ${truncateMiddle(data.stdout.trim(), 4_000)}`
+    : "";
+  const stderr = typeof data.stderr === "string" && data.stderr.trim()
+    ? `\n  stderr: ${truncateMiddle(data.stderr.trim(), 4_000)}`
+    : "";
+  return `${stdout}${stderr}`;
+}
+
+async function gitDiffSummary(rootPath: string): Promise<string> {
+  const statResult = await runProcess("git", ["diff", "--stat", "--", "."], rootPath, 20_000);
+  const nameResult = await runProcess("git", ["diff", "--name-only", "--", "."], rootPath, 20_000);
+  return [
+    statResult.stdout.trim(),
+    nameResult.stdout.trim() ? `\nChanged files:\n${nameResult.stdout.trim()}` : ""
+  ].filter(Boolean).join("\n") || "No diff.";
+}
+
+async function readPausedRun(pauseId: string): Promise<PausedGitHubRunRecord> {
+  assertSafePauseId(pauseId);
+  const content = await readFile(pausedRunPath(pauseId), "utf8");
+  return JSON.parse(content) as PausedGitHubRunRecord;
+}
+
+async function writePausedRun(record: PausedGitHubRunRecord): Promise<void> {
+  await mkdir(pausedRunsDirectory(), { recursive: true });
+  await writeFile(pausedRunPath(record.id), JSON.stringify({ ...record, updatedAt: new Date().toISOString() }, null, 2), "utf8");
+}
+
+async function deletePausedRun(pauseId: string, discardSandbox: boolean): Promise<void> {
+  const record = await readPausedRun(pauseId);
+  await rm(pausedRunPath(pauseId), { force: true });
+  if (discardSandbox) await removeSandbox(record.sandboxRoot);
+}
+
+async function removeSandbox(sandboxRoot: string): Promise<void> {
+  const base = agentSandboxBase();
+  const target = path.resolve(sandboxRoot);
+  const baseWithSeparator = `${base}${path.sep}`;
+  if (!target.startsWith(baseWithSeparator) || !path.basename(target).startsWith("github-pr-")) {
+    throw new Error("Refusing to discard a path that does not look like an agent sandbox.");
+  }
+  await rm(target, { recursive: true, force: true });
+}
+
+function pausedRunsDirectory(): string {
+  return path.join(agentSandboxBase(), "paused-runs");
+}
+
+function pausedRunPath(pauseId: string): string {
+  assertSafePauseId(pauseId);
+  return path.join(pausedRunsDirectory(), `${pauseId}.json`);
+}
+
+function assertSafePauseId(pauseId: string): void {
+  if (!/^[A-Za-z0-9_-]+$/.test(pauseId)) throw new Error("Invalid paused run id.");
+}
+
+function githubWriteMaxToolRounds(): number {
+  const configured = Number(process.env.GITHUB_WRITE_MAX_TOOL_ROUNDS);
+  return Number.isFinite(configured) ? Math.max(4, Math.min(80, Math.floor(configured))) : 18;
+}
+
+function pauseReasonLabel(reason: NonNullable<AgentRunResponse["stopReason"]>): string {
+  if (reason === "max_tool_rounds") return "the run reached the tool-round checkpoint";
+  if (reason === "provider_error") return "the model provider failed after partial progress";
+  if (reason === "validation_failed") return "validation failed after file changes";
+  return reason;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
 function prBody(prompt: string, result: AgentRunResponse, changedFiles: string[]): string {
   return [
     "## Request",
@@ -687,6 +1128,11 @@ function prBody(prompt: string, result: AgentRunResponse, changedFiles: string[]
     "## Changed Files",
     "",
     ...changedFiles.map((file) => `- \`${file}\``),
+    "",
+    "## Run Status",
+    "",
+    `Status: ${result.status || "completed"}`,
+    result.stopReason ? `Stop reason: ${result.stopReason}` : "",
     "",
     "## Safety",
     "",
@@ -704,6 +1150,8 @@ function recoverAgentRunResponse(
     provider,
     model: model || "provider-default",
     toolEvents,
+    status: "recovered",
+    stopReason: "provider_error",
     text: [
       "The model provider failed before returning a final response, so the repository workflow recovered from the error.",
       "",
@@ -738,6 +1186,12 @@ function trimOutput(value: string): string {
   return value.slice(-maxOutputBytes);
 }
 
+function truncateMiddle(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const edge = Math.max(1, Math.floor((maxChars - 80) / 2));
+  return `${value.slice(0, edge)}\n\n[...${value.length - (edge * 2)} characters omitted...]\n\n${value.slice(-edge)}`;
+}
+
 function countExactOccurrences(value: string, search: string): number {
   if (!search) return 0;
   let count = 0;
@@ -758,12 +1212,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }
 
-function repoRoot(): string {
-  let current = process.cwd();
-  while (true) {
-    if (existsSync(path.join(current, "DEVELOPMENT_AGENT_PLAN.md"))) return current;
-    const parent = path.dirname(current);
-    if (parent === current) return process.cwd();
-    current = parent;
-  }
+function agentSandboxBase(): string {
+  return path.resolve(process.env.AGENT_SANDBOX_ROOT || path.resolve(process.cwd(), "../..", ".agent-sandboxes"));
 }

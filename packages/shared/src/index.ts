@@ -41,6 +41,9 @@ export type AgentRunResponse = {
   model: string;
   text: string;
   toolEvents: AgentToolEvent[];
+  status?: "completed" | "paused" | "recovered";
+  stopReason?: "max_tool_rounds" | "provider_error" | "validation_failed";
+  maxToolRounds?: number;
 };
 
 export type AgentStreamEvent =

@@ -55,6 +55,7 @@ OPENAI_TASK_MODE_MODEL
 ANTHROPIC_TASK_MODE_MODEL
 GOOGLE_TASK_MODE_MODEL
 GROQ_TASK_MODE_MODEL
+GITHUB_WRITE_MAX_TOOL_ROUNDS
 ```
 
 The Google adapter queries model candidates in strength order by default:
@@ -65,9 +66,7 @@ happen after earlier tool calls in the same run. Override the full ordered pool
 with `GOOGLE_MODEL_CANDIDATES`, and set `GOOGLE_MODEL_RETRIES` to control the
 number of retries before moving to the next candidate. You can also append
 legacy fallbacks with `GOOGLE_MODEL`, `GOOGLE_BACKUP_MODEL`, and
-`GOOGLE_LAST_RESORT_MODEL`. If a provider failure happens after file edits, the
-GitHub workflow still preserves non-empty changes and opens a pull request
-instead of discarding the run.
+`GOOGLE_LAST_RESORT_MODEL`.
 
 When GitHub repository tasks run in `auto` mode, the app asks the selected model
 to classify the prompt as `read` or `write` with tools disabled. Set
@@ -141,6 +140,13 @@ commits non-empty changes, pushes the branch with a short-lived installation
 token, and opens a pull request against the repository default branch. If no
 non-empty file changes are produced, it returns the agent response without
 opening a pull request.
+
+Write runs pause for a human checkpoint instead of forcing a PR when they hit
+the tool-round cap, encounter a provider failure after partial progress, or
+leave failed validation commands such as typecheck, lint, test, build, or check.
+Paused runs keep their sandbox and diff, then the web UI offers **Continue**,
+**Open Draft PR**, **Stop Without PR**, and **Discard Sandbox**. Set
+`GITHUB_WRITE_MAX_TOOL_ROUNDS` to change the checkpoint size.
 
 The GitHub tab can also refresh open agent pull requests for the selected
 repository. It only shows PRs that look agent-created, such as `agent/*` branches

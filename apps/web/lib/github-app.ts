@@ -162,7 +162,8 @@ export async function openPullRequest({
   title,
   body,
   head,
-  base
+  base,
+  draft = false
 }: {
   installationId: number;
   repoFullName: string;
@@ -170,6 +171,7 @@ export async function openPullRequest({
   body: string;
   head: string;
   base: string;
+  draft?: boolean;
 }): Promise<{ htmlUrl: string; number: number }> {
   const installationToken = await createInstallationToken(installationId);
   const data = await githubRequest<Record<string, unknown>>(`/repos/${repoFullName}/pulls`, {
@@ -180,6 +182,7 @@ export async function openPullRequest({
       body,
       head,
       base,
+      draft,
       maintainer_can_modify: true
     }
   });

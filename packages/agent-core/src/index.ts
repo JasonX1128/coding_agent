@@ -300,8 +300,10 @@ function createOpenAIResponsesAdapter(): AgentProviderAdapter {
       let previousResponseId: string | undefined;
       let input: unknown = [{ role: "user", content: request.prompt }];
       let finalText = "";
+      const maxToolRounds = request.maxToolRounds ?? 8;
+      let stopReason: AgentRunResponse["stopReason"];
 
-      for (let round = 0; round < (request.maxToolRounds ?? 8); round += 1) {
+      for (let round = 0; round < maxToolRounds; round += 1) {
         const response = await fetch("https://api.openai.com/v1/responses", {
           method: "POST",
           headers: {
@@ -330,13 +332,17 @@ function createOpenAIResponsesAdapter(): AgentProviderAdapter {
           outputs.push({
             type: "function_call_output",
             call_id: call.id,
-            output: JSON.stringify(result)
+            output: toolFeedbackForModel(result)
           });
         }
         input = outputs;
+        if (round === maxToolRounds - 1) stopReason = "max_tool_rounds";
       }
 
-      return providerResponse("openai", model, finalText, toolEvents);
+      return providerResponse("openai", model, finalText, toolEvents, {
+        stopReason,
+        maxToolRounds
+      });
     }
   };
 }
@@ -355,8 +361,10 @@ function createAnthropicMessagesAdapter(): AgentProviderAdapter {
         { role: "user", content: request.prompt }
       ];
       let finalText = "";
+      const maxToolRounds = request.maxToolRounds ?? 8;
+      let stopReason: AgentRunResponse["stopReason"];
 
-      for (let round = 0; round < (request.maxToolRounds ?? 8); round += 1) {
+      for (let round = 0; round < maxToolRounds; round += 1) {
         const response = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
@@ -392,13 +400,17 @@ function createAnthropicMessagesAdapter(): AgentProviderAdapter {
           toolResults.push({
             type: "tool_result",
             tool_use_id: call.id,
-            content: JSON.stringify(result)
+            content: toolFeedbackForModel(result)
           });
         }
         messages.push({ role: "user", content: toolResults });
+        if (round === maxToolRounds - 1) stopReason = "max_tool_rounds";
       }
 
-      return providerResponse("anthropic", model, finalText, toolEvents);
+      return providerResponse("anthropic", model, finalText, toolEvents, {
+        stopReason,
+        maxToolRounds
+      });
     }
   };
 }
@@ -443,8 +455,10 @@ async function runGoogleGeminiModels({
   let candidateIndex = 0;
   const failures: GoogleModelFailure[] = [];
   const maxAttemptsPerModel = googleMaxAttemptsPerModel();
+  const maxToolRounds = request.maxToolRounds ?? 8;
+  let stopReason: AgentRunResponse["stopReason"];
 
-  for (let round = 0; round < (request.maxToolRounds ?? 8); round += 1) {
+  for (let round = 0; round < maxToolRounds; round += 1) {
     const response = await requestGoogleTurnWithFallback({
       apiKey,
       request,
@@ -472,14 +486,18 @@ async function runGoogleGeminiModels({
         functionResponse: {
           name: call.name,
           id: call.id,
-          response: { result }
+          response: compactToolResultForModel(result)
         }
       });
     }
     contents.push({ role: "user", parts: resultParts });
+    if (round === maxToolRounds - 1) stopReason = "max_tool_rounds";
   }
 
-  return providerResponse("google", activeModel, finalText, toolEvents);
+  return providerResponse("google", activeModel, finalText, toolEvents, {
+    stopReason,
+    maxToolRounds
+  });
 }
 
 async function requestGoogleTurnWithFallback({
@@ -561,8 +579,10 @@ function createGroqChatCompletionsAdapter(): AgentProviderAdapter {
         { role: "user", content: request.prompt }
       ];
       let finalText = "";
+      const maxToolRounds = request.maxToolRounds ?? 8;
+      let stopReason: AgentRunResponse["stopReason"];
 
-      for (let round = 0; round < (request.maxToolRounds ?? 8); round += 1) {
+      for (let round = 0; round < maxToolRounds; round += 1) {
         const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -592,12 +612,16 @@ function createGroqChatCompletionsAdapter(): AgentProviderAdapter {
             role: "tool",
             tool_call_id: call.id,
             name: call.name,
-            content: JSON.stringify(result)
+            content: toolFeedbackForModel(result)
           });
         }
+        if (round === maxToolRounds - 1) stopReason = "max_tool_rounds";
       }
 
-      return providerResponse("groq", model, finalText, toolEvents);
+      return providerResponse("groq", model, finalText, toolEvents, {
+        stopReason,
+        maxToolRounds
+      });
     }
   };
 }
@@ -644,14 +668,58 @@ function providerResponse(
   provider: AgentProvider,
   model: string,
   text: string,
-  toolEvents: AgentToolEvent[]
+  toolEvents: AgentToolEvent[],
+  options: Pick<AgentRunResponse, "stopReason" | "maxToolRounds"> = {}
 ): AgentRunResponse {
+  const stoppedByMaxRounds = options.stopReason === "max_tool_rounds";
   return {
     provider,
     model,
-    text: text || "The model completed without returning text.",
-    toolEvents
+    text: text || (stoppedByMaxRounds
+      ? "The model reached the tool-round checkpoint before returning final text."
+      : "The model completed without returning text."),
+    toolEvents,
+    status: stoppedByMaxRounds ? "paused" : "completed",
+    ...options
   };
+}
+
+function toolFeedbackForModel(result: ToolResult): string {
+  return JSON.stringify(compactToolResultForModel(result));
+}
+
+function compactToolResultForModel(result: ToolResult): ToolResult {
+  return {
+    ...result,
+    data: compactForModel(result.data)
+  };
+}
+
+function compactForModel(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") return truncateMiddle(value, 24_000);
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.slice(0, 120).map((item) => compactForModel(item, depth + 1));
+  if (depth > 4) return "[nested data omitted]";
+
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    const lowered = key.toLowerCase();
+    const limit = lowered.includes("stderr") || lowered.includes("stdout") || lowered.includes("output")
+      ? 16_000
+      : lowered.includes("content")
+        ? 24_000
+        : 8_000;
+    output[key] = typeof child === "string"
+      ? truncateMiddle(child, limit)
+      : compactForModel(child, depth + 1);
+  }
+  return output;
+}
+
+function truncateMiddle(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const edge = Math.floor((maxChars - 80) / 2);
+  return `${value.slice(0, edge)}\n\n[...${value.length - (edge * 2)} characters omitted...]\n\n${value.slice(-edge)}`;
 }
 
 function toOpenAIResponsesTools() {
