@@ -56,7 +56,7 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
   const installationToken = await createInstallationToken(repo.installationId);
   const sandboxRoot = await createSandboxRoot();
   const cloneUrl = tokenizedCloneUrl(repo.fullName, installationToken.token);
-  const mode = resolveTaskMode(request.prompt, request.mode || "auto");
+  const mode = resolveGitHubTaskMode(request.prompt, request.mode || "auto");
   const branchName = mode === "write" ? createAgentBranchName(request.prompt) : undefined;
 
   await runRequired("git", ["clone", "--depth", "1", cloneUrl, sandboxRoot], process.cwd(), 120_000, installationToken.token);
@@ -430,6 +430,8 @@ function buildRepositoryPrompt(
     `Working branch: ${branchName}`,
     "",
     "The user's prompt appears to request code or file changes, so write tools are enabled.",
+    "Do not stop with advice or a written plan when the user asks you to make changes.",
+    "Inspect the relevant files, then use create_file or apply_patch to implement the requested change.",
     "Use create_file for new text files and apply_patch for edits to existing files.",
     "Do not use run_command to create or edit files.",
     "Do not use touch, echo, cat, tee, heredocs, or shell redirection for file edits.",
@@ -480,10 +482,15 @@ function humanTitle(prompt: string): string {
   return line || "apply requested changes";
 }
 
-function resolveTaskMode(prompt: string, requestedMode: GitHubTaskMode): ResolvedGitHubTaskMode {
+export function resolveGitHubTaskMode(prompt: string, requestedMode: GitHubTaskMode = "auto"): ResolvedGitHubTaskMode {
   if (requestedMode === "read" || requestedMode === "write") return requestedMode;
   return promptLooksWriteIntent(prompt) ? "write" : "read";
 }
+
+const changeTargetPattern =
+  /\b(ui|ux|interface|screen|page|layout|style|styles|styling|css|theme|visual|design|component|button|panel|sidebar|toolbar|form|code|app|application|website|site|frontend|front[- ]end|view)\b/;
+const changeActionPattern =
+  /\b(make|build|create|add|write|edit|change|changes|update|updates|modify|fix|implement|refactor|remove|delete|rename|move|replace|redesign|restyle|polish|improve|revamp)\b/;
 
 function promptLooksWriteIntent(prompt: string): boolean {
   const text = prompt.toLowerCase();
@@ -491,20 +498,26 @@ function promptLooksWriteIntent(prompt: string): boolean {
     /\b(do not edit|don't edit|no changes|read[- ]only|without changing|just tell me)\b/,
     /^\s*(explain|summari[sz]e|describe|analy[sz]e|inspect|review|audit|find|look for|what|why|how|where|which|when|plan|recommend|compare)\b/
   ];
+  const adviceOnlyPattern = /\b(tell me|what should|recommend|suggest|advice|ideas)\b/;
+  const directImplementationPattern =
+    /\b(make|apply|implement|edit|update|modify|fix|redesign|restyle|polish|improve|revamp|create|add|write)\b/;
   const textOnlyCreationPattern =
     /^\s*(please\s+|can you\s+|could you\s+|would you\s+|i want you to\s+)?(create|write|make)\s+(a\s+|an\s+)?(plan|summary|analysis|explanation|recommendation)\b/;
   const fileArtifactPattern = /\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md)\b/;
   const pullRequestPattern = /\b(open|make|submit|raise)\b[\s\S]{0,40}\b(pr|pull request)\b/;
   const writePatterns = [
-    /^\s*(please\s+|can you\s+|could you\s+|would you\s+|i want you to\s+|let'?s\s+)?(add|create|write|edit|change|update|modify|fix|implement|refactor|remove|delete|rename|move|replace)\b/,
-    /\b(fix|implement|add|create|write|edit|change|update|modify|refactor|remove|delete|rename|move|replace)\b[\s\S]{0,80}\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md)\b/,
-    /\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md)\b[\s\S]{0,80}\b(add|create|write|edit|change|update|modify|fix|implement|refactor|remove|delete|rename|move|replace)\b/,
-    /\bmake\b[\s\S]{0,40}\b(file|change|edit|update|commit)\b/,
+    /^\s*(please\s+|can you\s+|could you\s+|would you\s+|i want you to\s+|let'?s\s+)?(add|create|write|edit|change|update|modify|fix|implement|refactor|remove|delete|rename|move|replace|redesign|restyle|polish|improve|revamp)\b/,
+    /\b(fix|implement|add|create|write|edit|change|changes|update|updates|modify|refactor|remove|delete|rename|move|replace|redesign|restyle|polish|improve|revamp)\b[\s\S]{0,100}\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md|ui|ux|interface|layout|style|styles|styling|css|theme|visual|design|frontend|front[- ]end|page|screen)\b/,
+    /\b(file|readme|test|bug|feature|function|component|endpoint|route|code|docs|documentation|markdown|md|ui|ux|interface|layout|style|styles|styling|css|theme|visual|design|frontend|front[- ]end|page|screen)\b[\s\S]{0,100}\b(add|create|write|edit|change|changes|update|updates|modify|fix|implement|refactor|remove|delete|rename|move|replace|redesign|restyle|polish|improve|revamp)\b/,
+    /\bmake\b[\s\S]{0,80}\b(file|files|change|changes|edit|edits|update|updates|commit|code|ui|ux|interface|layout|style|styles|styling|css|theme|visual|design|frontend|front[- ]end|page|screen)\b/,
+    /\bmake\b[\s\S]{0,80}\b(look|feel|match|resemble)\b/,
     /\bfix\s+(it|this|that)\b/
   ];
 
   if (pullRequestPattern.test(text)) return true;
   if (textOnlyCreationPattern.test(text) && !fileArtifactPattern.test(text)) return false;
+  if (adviceOnlyPattern.test(text) && !directImplementationPattern.test(text)) return false;
+  if (changeActionPattern.test(text) && changeTargetPattern.test(text)) return true;
   if (explicitReadOnlyPatterns.some((pattern) => pattern.test(text)) && !writePatterns.some((pattern) => pattern.test(text))) {
     return false;
   }
