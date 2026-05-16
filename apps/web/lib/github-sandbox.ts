@@ -1,6 +1,7 @@
 import { runAgentTask, type ToolExecutor } from "@coding-agent/agent-core";
 import type {
   AgentProvider,
+  AgentToolEvent,
   AgentRunResponse,
   CommandResult,
   CreateFileResult,
@@ -32,6 +33,7 @@ export type GitHubRepositoryTaskRequest = {
   provider: AgentProvider;
   model?: string;
   mode?: GitHubTaskMode;
+  onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
 };
 
 export type GitHubRepositoryTaskResult = AgentRunResponse & {
@@ -75,7 +77,8 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
     model: request.model,
     prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt),
     executor,
-    maxToolRounds: 12
+    maxToolRounds: 12,
+    onToolEvent: request.onToolEvent
   });
 
   const changedFiles = await changedFileNames(rootPath);

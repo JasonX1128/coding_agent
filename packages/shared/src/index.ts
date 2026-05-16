@@ -33,6 +33,11 @@ export type AgentRunResponse = {
   toolEvents: AgentToolEvent[];
 };
 
+export type AgentStreamEvent =
+  | { type: "tool_event"; event: AgentToolEvent }
+  | { type: "result"; result: AgentRunResponse }
+  | { type: "error"; error: string };
+
 export type ListFilesResult = {
   rootPath: string;
   files: Array<{

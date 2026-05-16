@@ -5,6 +5,7 @@ import {
   DEFAULT_DAEMON_ORIGIN,
   type AgentProvider,
   type AgentRunResponse,
+  type AgentStreamEvent,
   type AgentToolEvent,
   type Workspace
 } from "@coding-agent/shared";
@@ -64,6 +65,7 @@ export default function Home() {
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("Inspect this repository and summarize what is implemented.");
   const [agentResult, setAgentResult] = useState<AgentRunResponse | null>(null);
+  const [localToolEvents, setLocalToolEvents] = useState<AgentToolEvent[]>([]);
   const [toolOutput, setToolOutput] = useState<ToolPayload | null>(null);
   const [selectedFile, setSelectedFile] = useState("DEVELOPMENT_AGENT_PLAN.md");
   const [searchQuery, setSearchQuery] = useState("agent");
@@ -74,6 +76,7 @@ export default function Home() {
   const [githubRepoFullName, setGithubRepoFullName] = useState("");
   const [githubPrompt, setGithubPrompt] = useState("Inspect this repository and summarize what it does.");
   const [githubResult, setGithubResult] = useState<GitHubTaskResult | null>(null);
+  const [githubToolEvents, setGithubToolEvents] = useState<AgentToolEvent[]>([]);
   const [githubPullRequests, setGithubPullRequests] = useState<GitHubPullRequest[]>([]);
   const [githubPullMessage, setGithubPullMessage] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -157,8 +160,9 @@ export default function Home() {
     setBusy("agent");
     setError(null);
     setAgentResult(null);
+    setLocalToolEvents([]);
     try {
-      const response = await fetch("/api/agent", {
+      const response = await fetch("/api/agent/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -169,8 +173,9 @@ export default function Home() {
           workspaceId
         })
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error || "Agent request failed.");
+      const data = await readAgentStream<AgentRunResponse>(response, (event) => {
+        setLocalToolEvents((current) => [...current, event]);
+      });
       setAgentResult(data);
     } catch (caught) {
       setError(errorMessage(caught));
@@ -183,9 +188,10 @@ export default function Home() {
     setBusy("github-agent");
     setError(null);
     setGithubResult(null);
+    setGithubToolEvents([]);
     try {
       if (!selectedGithubRepo) throw new Error("Select an installed GitHub repository first.");
-      const response = await fetch("/api/github/tasks", {
+      const response = await fetch("/api/github/tasks/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -197,8 +203,9 @@ export default function Home() {
           mode: "auto"
         })
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error || "GitHub agent request failed.");
+      const data = await readAgentStream<GitHubTaskResult>(response, (event) => {
+        setGithubToolEvents((current) => [...current, event]);
+      });
       setGithubResult(data);
     } catch (caught) {
       setError(errorMessage(caught));
@@ -300,7 +307,9 @@ export default function Home() {
     }
   }
 
-  const eventList = activeTab === "github" ? githubResult?.toolEvents : agentResult?.toolEvents;
+  const eventList = activeTab === "github"
+    ? githubResult?.toolEvents || githubToolEvents
+    : agentResult?.toolEvents || localToolEvents;
 
   return (
     <main className="shell">
@@ -641,6 +650,53 @@ function ToolEvents({ events }: { events: AgentToolEvent[] }) {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
+}
+
+async function readAgentStream<T extends AgentRunResponse>(
+  response: Response,
+  onToolEvent: (event: AgentToolEvent) => void
+): Promise<T> {
+  if (!response.body) throw new Error("Agent stream response did not include a body.");
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data?.error || "Agent stream request failed.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalResult: T | null = null;
+
+  const handleLine = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as AgentStreamEvent;
+    if (event.type === "tool_event") {
+      onToolEvent(event.event);
+      return;
+    }
+    if (event.type === "result") {
+      finalResult = event.result as T;
+      return;
+    }
+    if (event.type === "error") {
+      throw new Error(event.error);
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) handleLine(line);
+  }
+
+  buffer += decoder.decode();
+  handleLine(buffer);
+
+  if (!finalResult) throw new Error("Agent stream ended without a final result.");
+  return finalResult;
 }
 
 function formatRelativeDate(value: string): string {

@@ -17,6 +17,7 @@ export type AgentRunRequest = {
   prompt: string;
   executor: ToolExecutor;
   maxToolRounds?: number;
+  onToolEvent?: (event: AgentToolEvent) => void | Promise<void>;
 };
 
 type ModelToolCall = {
@@ -182,12 +183,14 @@ function createMockAdapter(): AgentProviderAdapter {
       const fileResult = await executeToolCall(
         request.executor,
         { id: "mock-list-files", name: "list_files", args: { path: ".", maxFiles: 80 } },
-        toolEvents
+        toolEvents,
+        request.onToolEvent
       );
       const gitResult = await executeToolCall(
         request.executor,
         { id: "mock-git-status", name: "git_status", args: {} },
-        toolEvents
+        toolEvents,
+        request.onToolEvent
       );
 
       return {
@@ -245,7 +248,7 @@ function createOpenAIResponsesAdapter(): AgentProviderAdapter {
 
         const outputs = [];
         for (const call of turn.toolCalls) {
-          const result = await executeToolCall(request.executor, call, toolEvents);
+          const result = await executeToolCall(request.executor, call, toolEvents, request.onToolEvent);
           outputs.push({
             type: "function_call_output",
             call_id: call.id,
@@ -307,7 +310,7 @@ function createAnthropicMessagesAdapter(): AgentProviderAdapter {
 
         const toolResults = [];
         for (const call of turn.toolCalls) {
-          const result = await executeToolCall(request.executor, call, toolEvents);
+          const result = await executeToolCall(request.executor, call, toolEvents, request.onToolEvent);
           toolResults.push({
             type: "tool_result",
             tool_use_id: call.id,
@@ -409,7 +412,7 @@ async function runGoogleGeminiModel({
 
     const resultParts = [];
     for (const call of turn.toolCalls) {
-      const result = await executeToolCall(request.executor, call, toolEvents);
+      const result = await executeToolCall(request.executor, call, toolEvents, request.onToolEvent);
       resultParts.push({
         functionResponse: {
           name: call.name,
@@ -465,7 +468,7 @@ function createGroqChatCompletionsAdapter(): AgentProviderAdapter {
         if (turn.toolCalls.length === 0) break;
 
         for (const call of turn.toolCalls) {
-          const result = await executeToolCall(request.executor, call, toolEvents);
+          const result = await executeToolCall(request.executor, call, toolEvents, request.onToolEvent);
           messages.push({
             role: "tool",
             tool_call_id: call.id,
@@ -483,15 +486,18 @@ function createGroqChatCompletionsAdapter(): AgentProviderAdapter {
 async function executeToolCall(
   executor: ToolExecutor,
   call: ModelToolCall,
-  toolEvents: AgentToolEvent[]
+  toolEvents: AgentToolEvent[],
+  onToolEvent?: (event: AgentToolEvent) => void | Promise<void>
 ): Promise<ToolResult> {
   const result = await executor(call.name, call.args);
-  toolEvents.push({
+  const event: AgentToolEvent = {
     id: call.id,
     name: call.name,
     args: call.args,
     result
-  });
+  };
+  toolEvents.push(event);
+  if (onToolEvent) await onToolEvent(event);
   return result;
 }
 

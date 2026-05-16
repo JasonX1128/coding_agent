@@ -29,6 +29,11 @@ http://127.0.0.1:4317
 
 If no provider API key is configured, select `mock` in the UI. Mock mode still exercises the tool pipeline by calling the local daemon or GitHub sandbox tools.
 
+Agent runs in the web UI stream tool events live. The Tool Events panel updates
+as each tool call completes, then the chat output fills in when the final model
+response arrives. The non-streaming JSON routes still exist for simple API
+clients.
+
 Supported provider environment variables:
 
 ```text
