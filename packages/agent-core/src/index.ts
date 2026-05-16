@@ -82,6 +82,7 @@ const googleDefaultModelCandidates = [
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite"
 ];
+const googleDefaultModelRetries = 2;
 const googleModelStrengthOrder = [
   "gemini-3.1-pro-preview",
   "gemini-3-pro-preview",
@@ -441,6 +442,7 @@ async function runGoogleGeminiModels({
   let activeModel = modelCandidates[0] || googleDefaultModel;
   let candidateIndex = 0;
   const failures: GoogleModelFailure[] = [];
+  const maxAttemptsPerModel = googleMaxAttemptsPerModel();
 
   for (let round = 0; round < (request.maxToolRounds ?? 8); round += 1) {
     const response = await requestGoogleTurnWithFallback({
@@ -449,7 +451,8 @@ async function runGoogleGeminiModels({
       contents,
       modelCandidates,
       startIndex: candidateIndex,
-      failures
+      failures,
+      maxAttemptsPerModel
     });
     activeModel = response.model;
     candidateIndex = response.index;
@@ -485,7 +488,8 @@ async function requestGoogleTurnWithFallback({
   contents,
   modelCandidates,
   startIndex,
-  failures
+  failures,
+  maxAttemptsPerModel
 }: {
   apiKey: string;
   request: AgentRunRequest;
@@ -493,41 +497,46 @@ async function requestGoogleTurnWithFallback({
   modelCandidates: string[];
   startIndex: number;
   failures: GoogleModelFailure[];
+  maxAttemptsPerModel: number;
 }): Promise<{ data: Record<string, unknown>; model: string; index: number }> {
   for (let index = startIndex; index < modelCandidates.length; index += 1) {
     const candidate = modelCandidates[index];
     if (!candidate) continue;
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${googleModelPath(candidate)}:generateContent`,
-        {
-          method: "POST",
-          headers: {
-            "x-goog-api-key": apiKey,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            systemInstruction: {
-              parts: [{ text: instructions }]
+
+    for (let attempt = 1; attempt <= maxAttemptsPerModel; attempt += 1) {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${googleModelPath(candidate)}:generateContent`,
+          {
+            method: "POST",
+            headers: {
+              "x-goog-api-key": apiKey,
+              "Content-Type": "application/json"
             },
-            contents,
-            tools: request.toolsEnabled === false ? undefined : [
-              {
-                functionDeclarations: toGoogleFunctionDeclarations()
-              }
-            ]
-          })
-        }
-      );
-      return {
-        data: await readJsonResponse(response),
-        model: candidate,
-        index
-      };
-    } catch (error) {
-      const message = `Google model "${candidate}" request failed: ${errorMessage(error)}`;
-      failures.push({ model: candidate, message });
-      if (!shouldTryNextGoogleModel(error)) throw new Error(message);
+            body: JSON.stringify({
+              systemInstruction: {
+                parts: [{ text: instructions }]
+              },
+              contents,
+              tools: request.toolsEnabled === false ? undefined : [
+                {
+                  functionDeclarations: toGoogleFunctionDeclarations()
+                }
+              ]
+            })
+          }
+        );
+        return {
+          data: await readJsonResponse(response),
+          model: candidate,
+          index
+        };
+      } catch (error) {
+        const message = `Google model "${candidate}" attempt ${attempt}/${maxAttemptsPerModel} failed: ${errorMessage(error)}`;
+        failures.push({ model: candidate, message });
+        if (!shouldRetryGoogleModel(error) || attempt === maxAttemptsPerModel) break;
+        await sleep(googleRetryDelayMs(attempt));
+      }
     }
   }
 
@@ -936,7 +945,13 @@ function googleModelPath(model: string): string {
   return encodeURIComponent(model.replace(/^models\//, ""));
 }
 
-function shouldTryNextGoogleModel(error: unknown): boolean {
+function googleMaxAttemptsPerModel(): number {
+  const configured = Number(process.env.GOOGLE_MODEL_RETRIES);
+  const retries = Number.isFinite(configured) ? Math.max(0, Math.min(5, Math.floor(configured))) : googleDefaultModelRetries;
+  return retries + 1;
+}
+
+function shouldRetryGoogleModel(error: unknown): boolean {
   const message = errorMessage(error).toLowerCase();
   return [
     "high demand",
@@ -948,11 +963,23 @@ function shouldTryNextGoogleModel(error: unknown): boolean {
     "quota",
     "rate limit",
     "429",
+    "500",
+    "502",
     "503",
-    "not found",
-    "not supported",
-    "permission"
+    "504",
+    "network",
+    "fetch failed",
+    "econnreset",
+    "etimedout"
   ].some((pattern) => message.includes(pattern));
+}
+
+function googleRetryDelayMs(attempt: number): number {
+  return Math.min(4_000, 500 * 2 ** Math.max(0, attempt - 1));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function errorMessage(error: unknown): string {

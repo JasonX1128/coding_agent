@@ -80,15 +80,24 @@ export async function runGitHubRepositoryTask(request: GitHubRepositoryTaskReque
 
   const rootPath = await realpath(sandboxRoot);
   const executor = mode === "write" ? createWritableSandboxExecutor(rootPath) : createReadOnlySandboxExecutor(rootPath);
-  const result = await runAgentTask({
-    provider: request.provider,
-    model: request.model,
-    prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt),
-    executor,
-    maxToolRounds: mode === "write" ? 18 : 12,
-    onToolStart: request.onToolStart,
-    onToolEvent: request.onToolEvent
-  });
+  const collectedToolEvents: AgentToolEvent[] = [];
+  let result: AgentRunResponse;
+  try {
+    result = await runAgentTask({
+      provider: request.provider,
+      model: request.model,
+      prompt: buildRepositoryPrompt(repo.fullName, repo.defaultBranch, branchName, mode, request.prompt),
+      executor,
+      maxToolRounds: mode === "write" ? 18 : 12,
+      onToolStart: request.onToolStart,
+      onToolEvent: async (event) => {
+        collectedToolEvents.push(event);
+        await request.onToolEvent?.(event);
+      }
+    });
+  } catch (error) {
+    result = recoverAgentRunResponse(request.provider, request.model, collectedToolEvents, error);
+  }
 
   const changedFiles = await changedFileNames(rootPath);
   const committableFiles = await committableChangedFileNames(rootPath, changedFiles);
@@ -685,6 +694,26 @@ function prBody(prompt: string, result: AgentRunResponse, changedFiles: string[]
   ].join("\n");
 }
 
+function recoverAgentRunResponse(
+  provider: AgentProvider,
+  model: string | undefined,
+  toolEvents: AgentToolEvent[],
+  error: unknown
+): AgentRunResponse {
+  return {
+    provider,
+    model: model || "provider-default",
+    toolEvents,
+    text: [
+      "The model provider failed before returning a final response, so the repository workflow recovered from the error.",
+      "",
+      `Provider error: ${errorMessage(error)}`,
+      "",
+      "Any non-empty file changes produced before the failure were still inspected and handled by the GitHub workflow."
+    ].join("\n")
+  };
+}
+
 function scoreCommandRisk(command: string): "low" | "medium" | "high" {
   const lower = command.toLowerCase();
   if (/(^|\s)(sudo|rm|dd|mkfs|chmod|chown|curl|wget|ssh|scp)\b/.test(lower)) return "high";
@@ -723,6 +752,10 @@ function countExactOccurrences(value: string, search: string): number {
 function redact(value: string, secret?: string): string {
   if (!secret) return value;
   return value.replaceAll(secret, "[redacted]");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown error";
 }
 
 function repoRoot(): string {

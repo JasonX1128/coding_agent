@@ -46,6 +46,7 @@ ANTHROPIC_API_KEY
 GEMINI_API_KEY
 GOOGLE_MODEL
 GOOGLE_MODEL_CANDIDATES
+GOOGLE_MODEL_RETRIES
 GOOGLE_BACKUP_MODEL
 GOOGLE_LAST_RESORT_MODEL
 GROQ_API_KEY
@@ -61,8 +62,12 @@ The Google adapter queries model candidates in strength order by default:
 `gemma-4-26b-a4b-it`, `gemini-2.5-flash`, then `gemini-2.5-flash-lite`. It falls through on model
 availability, quota, rate-limit, and high-demand errors, including failures that
 happen after earlier tool calls in the same run. Override the full ordered pool
-with `GOOGLE_MODEL_CANDIDATES`, or append legacy fallbacks with `GOOGLE_MODEL`,
-`GOOGLE_BACKUP_MODEL`, and `GOOGLE_LAST_RESORT_MODEL`.
+with `GOOGLE_MODEL_CANDIDATES`, and set `GOOGLE_MODEL_RETRIES` to control the
+number of retries before moving to the next candidate. You can also append
+legacy fallbacks with `GOOGLE_MODEL`, `GOOGLE_BACKUP_MODEL`, and
+`GOOGLE_LAST_RESORT_MODEL`. If a provider failure happens after file edits, the
+GitHub workflow still preserves non-empty changes and opens a pull request
+instead of discarding the run.
 
 When GitHub repository tasks run in `auto` mode, the app asks the selected model
 to classify the prompt as `read` or `write` with tools disabled. Set
