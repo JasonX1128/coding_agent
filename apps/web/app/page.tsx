@@ -94,6 +94,10 @@ export default function Home() {
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("Inspect this repository and summarize what is implemented.");
   const [agentResult, setAgentResult] = useState<AgentRunResponse | null>(null);
+  // Supporting Chat History
+  const [chatSessions, setChatSessions] = useState<Record<string, { id: string; title: string; messages: { prompt: string; result: AgentRunResponse; timestamp: number }[] }>>({});
+  const [currentChatId, setCurrentChatId] = useState<string>("default");
+
   const [localToolEvents, setLocalToolEvents] = useState<LiveToolEvent[]>([]);
   const [localRunTimer, setLocalRunTimer] = useState<RunTimer | null>(null);
   const [localActivity, setLocalActivity] = useState<ActivityEntry[]>([]);
@@ -222,6 +226,8 @@ export default function Home() {
           workspaceId
         })
       });
+
+      // Update session history
       const data = await readAgentStream<AgentRunResponse>(response, {
         onToolStart: (event) => {
           setLocalToolEvents((current) => upsertLiveToolEvent(current, event));
@@ -238,7 +244,23 @@ export default function Home() {
           ]);
         }
       });
+
       setAgentResult(data);
+
+      setChatSessions((prev) => {
+        const session = prev[currentChatId] || { id: currentChatId, title: prompt.slice(0, 30), messages: [] };
+        return {
+          ...prev,
+          [currentChatId]: {
+            ...session,
+            messages: [
+              ...session.messages,
+              { prompt, result: data, timestamp: Date.now() }
+            ]
+          }
+        };
+      });
+
       setLocalActivity((current) => [
         ...current,
         createActivityEntry(describeRunFinish(startedAt, Date.now(), data.toolEvents), "done")
@@ -642,6 +664,8 @@ export default function Home() {
                 runLocalAgent={runLocalAgent}
                 busy={busy}
                 agentResult={agentResult}
+                chatSessions={chatSessions}
+                currentChatId={currentChatId}
                 runTimer={localRunTimer}
                 now={clockNow}
               />
@@ -742,6 +766,8 @@ function LocalAgentPanel({
   runLocalAgent,
   busy,
   agentResult,
+  chatSessions,
+  currentChatId,
   runTimer,
   now
 }: {
@@ -750,6 +776,8 @@ function LocalAgentPanel({
   runLocalAgent: () => void;
   busy: string | null;
   agentResult: AgentRunResponse | null;
+  chatSessions: Record<string, { id: string; title: string; messages: { prompt: string; result: AgentRunResponse; timestamp: number }[] }>;
+  currentChatId: string;
   runTimer: RunTimer | null;
   now: number;
 }) {
@@ -763,7 +791,12 @@ function LocalAgentPanel({
       <button className="primary" disabled={busy === "agent" || !prompt.trim()} onClick={runLocalAgent}>
         Run Local Agent
       </button>
-      <pre className="chat-output">{agentResult?.text || "No local agent result yet."}</pre>
+      {chatSessions[currentChatId]?.messages.map((m, i) => (
+        <pre key={i} className="chat-output">
+          <strong>Prompt:</strong> {m.prompt}<br/>
+          <strong>Result:</strong> {m.result.text}
+        </pre>
+      ))}
     </section>
   );
 }
